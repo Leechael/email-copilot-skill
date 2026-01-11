@@ -1,0 +1,56 @@
+# Email Rules
+
+## My Persona
+- **Role**: [Your role, e.g., Software Engineer, Product Manager]
+- **Current Focus**: [Your current projects or interests]
+- **Language**: [Your preferred languages]
+
+## Active Projects (High Priority)
+*Emails matching these keywords should be highlighted or grouped specifically.*
+
+- **Project A**: Keywords: `project-a`, `team-alpha`
+- **Project B**: Keywords: `project-b`, `deadline`
+
+## Auto-Trash List
+*Senders or subjects that should be deleted immediately without asking.*
+
+### Senders
+- `marketing@*`
+- `noreply@spam.com`
+- `*@promotions.example.com`
+
+### Subjects
+- `Unsubscribe`
+- `Weekly digest` (if > 7 days old)
+- `Your daily summary`
+
+## Categories
+
+### 1. Urgent/Action
+*Keep in Inbox, notify immediately.*
+- Billing warnings
+- Server alerts
+- Deadline reminders
+
+### 2. Finance
+- **Invoices (To Pay)**: Keep in Inbox
+- **Receipts (Paid)**: Move to `Finance/Receipts`
+- **Statements**: Move to `Finance/Receipts`
+
+### 3. Human Communication
+- Code reviews with "approved", "LGTM", "request changes"
+- Direct replies and mentions
+
+### 4. CI/Bots
+- **Keep**: Release notifications
+- **Trash**: Deployment success (> 1 hour old), automated reports
+
+### 5. Newsletters
+- **Tech Updates**: Summarize, then move to `to-be-deleted`
+- **Marketing/Promos**: Trash immediately
+- **Weekly Digests**: Move to `Read Later`
+
+## Time-Based Rules
+- Confirmation codes > 1 hour old: Trash
+- Weekly reports > 7 days old: Trash
+- Service notifications > 1 day old: Trash

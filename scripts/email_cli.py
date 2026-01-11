@@ -1,0 +1,1132 @@
+#!/usr/bin/env python3
+"""
+Unified Email CLI for email-copilot skill.
+Supports multi-account operations, email management, filter operations, attachments, and sending.
+"""
+import sys
+import os
+import json
+import time
+import base64
+import argparse
+import mimetypes
+import re
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from datetime import datetime, timedelta
+
+# Add skill directory to sys.path for local imports
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, SKILL_DIR)
+from gmail_client import GmailClient, get_available_accounts, CONFIG_PATH
+
+
+def get_client(account: str = None) -> GmailClient:
+    """Get authenticated Gmail client for specified account."""
+    client = GmailClient(account=account)
+    client.authenticate()
+    return client
+
+
+# =============================================================================
+# Account Management
+# =============================================================================
+
+def cmd_accounts(args):
+    """List all configured accounts."""
+    accounts = get_available_accounts()
+    if not accounts:
+        print(json.dumps({"accounts": [], "count": 0}))
+        return
+
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            config = tomllib.load(f)
+        default = config.get("gmail", {}).get("default_account", "default")
+    except:
+        default = "default"
+
+    output = []
+    for name, info in accounts.items():
+        output.append({
+            "name": name,
+            "email": info.get("email", "(not authenticated)"),
+            "is_default": name == default,
+        })
+
+    print(json.dumps({"accounts": output, "count": len(output)}, indent=2))
+
+
+# =============================================================================
+# Email Operations
+# =============================================================================
+
+def cmd_list(args):
+    """List emails with optional search query."""
+    client = get_client(args.account)
+
+    query = args.query if args.query else "label:INBOX"
+    all_msgs = []
+    page_token = None
+
+    while len(all_msgs) < args.limit:
+        try:
+            res = (
+                client.service.users()
+                .messages()
+                .list(
+                    userId="me",
+                    q=query,
+                    maxResults=min(args.limit - len(all_msgs), 500),
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+
+            msgs = res.get("messages", [])
+            if not msgs:
+                if not page_token:
+                    break
+            else:
+                all_msgs.extend(msgs)
+
+            page_token = res.get("nextPageToken")
+            if not page_token:
+                break
+        except Exception as e:
+            print(f"<error>{str(e)}</error>")
+            return
+
+    if not all_msgs:
+        print(f"<emails account='{client.account_email}' account_name='{client.account_name}' count='0'></emails>")
+        return
+
+    # Fetch details in batch
+    chunk_size = 50
+    output = [f"<emails account='{client.account_email}' account_name='{client.account_name}' count='{len(all_msgs)}'>"]
+
+    for i in range(0, len(all_msgs), chunk_size):
+        chunk = all_msgs[i : i + chunk_size]
+        batch = client.service.new_batch_http_request()
+        batch_resp = {}
+
+        def cb(rid, resp, exc):
+            if not exc:
+                batch_resp[rid] = resp
+
+        for msg in chunk:
+            batch.add(
+                client.service.users()
+                .messages()
+                .get(userId="me", id=msg["id"], format="full"),
+                request_id=msg["id"],
+                callback=cb,
+            )
+
+        try:
+            batch.execute()
+        except Exception as e:
+            output.append(f"  <batch_error>{str(e)}</batch_error>")
+            continue
+
+        for mid, data in batch_resp.items():
+            payload = data.get("payload", {})
+            headers = payload.get("headers", [])
+
+            subject = next(
+                (h["value"] for h in headers if h["name"].lower() == "subject"),
+                "No Subject",
+            )
+            sender = next(
+                (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
+            )
+            date = next(
+                (h["value"] for h in headers if h["name"].lower() == "date"), ""
+            )
+            snippet = (
+                data.get("snippet", "").replace("<", "&lt;").replace(">", "&gt;")
+            )
+            thread_id = data.get("threadId", "")
+
+            output.append(f"""  <email id="{mid}" thread_id="{thread_id}">
+    <from>{sender}</from>
+    <subject>{subject}</subject>
+    <date>{date}</date>
+    <snippet>{snippet}</snippet>
+  </email>""")
+
+    output.append("</emails>")
+    print("\n".join(output))
+
+
+def cmd_read(args):
+    """Read full email content."""
+    client = get_client(args.account)
+
+    try:
+        msg = (
+            client.service.users()
+            .messages()
+            .get(userId="me", id=args.id, format="full")
+            .execute()
+        )
+
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
+        subject = next(
+            (h["value"] for h in headers if h["name"].lower() == "subject"),
+            "No Subject",
+        )
+        sender = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
+        )
+
+        body = ""
+        if "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/plain":
+                    data = part["body"].get("data", "")
+                    if data:
+                        body = base64.urlsafe_b64decode(data).decode("utf-8")
+                        break
+        elif "body" in payload:
+            data = payload["body"].get("data", "")
+            if data:
+                body = base64.urlsafe_b64decode(data).decode("utf-8")
+
+        if not body:
+            body = msg.get("snippet", "")
+
+        print(f"Account: {client.account_email} ({client.account_name})")
+        print(f"Subject: {subject}\nFrom: {sender}\n{'-' * 40}\n{body}")
+
+    except Exception as e:
+        print(json.dumps({"error": str(e)}))
+
+
+def cmd_trash(args):
+    """Move emails to trash."""
+    client = get_client(args.account)
+    ids = parse_ids(args.ids)
+    if not ids:
+        print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
+        return
+
+    batch = client.service.new_batch_http_request()
+    count = 0
+    total = len(ids)
+
+    for mid in ids:
+        batch.add(client.service.users().messages().trash(userId="me", id=mid))
+        count += 1
+
+        if count % 50 == 0 or count == total:
+            try:
+                batch.execute()
+                time.sleep(0.5)
+                batch = client.service.new_batch_http_request()
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+                return
+
+    print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+
+
+def cmd_untrash(args):
+    """Restore emails from trash."""
+    client = get_client(args.account)
+    ids = parse_ids(args.ids)
+    if not ids:
+        print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
+        return
+
+    batch = client.service.new_batch_http_request()
+    count = 0
+    total = len(ids)
+
+    for mid in ids:
+        batch.add(client.service.users().messages().untrash(userId="me", id=mid))
+        count += 1
+
+        if count % 50 == 0 or count == total:
+            try:
+                batch.execute()
+                time.sleep(0.5)
+                batch = client.service.new_batch_http_request()
+            except Exception as e:
+                print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+                return
+
+    print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+
+
+def cmd_move(args):
+    """Move emails to a label with optional mark-as-read."""
+    client = get_client(args.account)
+    ids = parse_ids(args.ids)
+    if not ids:
+        print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
+        return
+
+    label_id = ensure_label(client, args.label)
+    if not label_id:
+        print(json.dumps({"status": "error", "message": "Could not ensure label", "account": client.account_email}))
+        return
+
+    # Build modification body
+    add_labels = [label_id]
+    remove_labels = ["INBOX"]
+
+    if args.read:
+        remove_labels.append("UNREAD")
+
+    body = {"ids": ids, "addLabelIds": add_labels, "removeLabelIds": remove_labels}
+
+    try:
+        client.service.users().messages().batchModify(userId="me", body=body).execute()
+        result = {"status": "success", "count": len(ids), "label": args.label, "account": client.account_email}
+        if args.read:
+            result["marked_read"] = True
+        print(json.dumps(result))
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+
+
+# =============================================================================
+# Maintenance Commands
+# =============================================================================
+
+def cmd_summary(args):
+    """Get email content from a label for summarization."""
+    client = get_client(args.account)
+
+    # Find label ID
+    results = client.service.users().labels().list(userId="me").execute()
+    label_id = next(
+        (
+            l["id"]
+            for l in results.get("labels", [])
+            if l["name"].lower() == args.label.lower()
+        ),
+        None,
+    )
+
+    if not label_id:
+        print(json.dumps({"error": f"Label '{args.label}' not found", "account": client.account_email}))
+        return
+
+    resp = (
+        client.service.users()
+        .messages()
+        .list(userId="me", labelIds=[label_id], maxResults=args.limit)
+        .execute()
+    )
+    msgs = resp.get("messages", [])
+
+    if not msgs:
+        print(json.dumps({"emails": [], "count": 0, "account": client.account_email}))
+        return
+
+    batch = client.service.new_batch_http_request()
+    batch_resp = {}
+
+    def cb(rid, resp, exc):
+        if not exc:
+            batch_resp[rid] = resp
+
+    for msg in msgs:
+        batch.add(
+            client.service.users()
+            .messages()
+            .get(userId="me", id=msg["id"], format="full"),
+            request_id=msg["id"],
+            callback=cb,
+        )
+
+    batch.execute()
+    output = []
+
+    for mid, data in batch_resp.items():
+        payload = data.get("payload", {})
+        headers = payload.get("headers", [])
+
+        subject = next(
+            (h["value"] for h in headers if h["name"].lower() == "subject"),
+            "No Subject",
+        )
+        sender = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
+        )
+        date = next((h["value"] for h in headers if h["name"].lower() == "date"), "")
+
+        body = ""
+        if "parts" in payload:
+            for part in payload["parts"]:
+                if part["mimeType"] == "text/plain":
+                    data_enc = part["body"].get("data", "")
+                    if data_enc:
+                        body = base64.urlsafe_b64decode(data_enc).decode("utf-8")
+                        break
+        elif "body" in payload:
+            data_enc = payload["body"].get("data", "")
+            if data_enc:
+                body = base64.urlsafe_b64decode(data_enc).decode("utf-8")
+
+        if not body:
+            body = data.get("snippet", "")
+
+        output.append({
+            "id": mid,
+            "subject": subject,
+            "from": sender,
+            "date": date,
+            "body": body[:2000],
+        })
+
+    print(json.dumps({"emails": output, "count": len(output), "account": client.account_email}, indent=2))
+
+
+def cmd_cleanup(args):
+    """Delete emails older than N days from a label."""
+    client = get_client(args.account)
+
+    cutoff_date = datetime.now() - timedelta(days=args.days)
+    date_query = cutoff_date.strftime("%Y/%m/%d")
+    query = f"label:{args.label} before:{date_query}"
+
+    print(f"[{client.account_email}] Searching for emails in '{args.label}' before {date_query}...", file=sys.stderr)
+
+    msgs_to_trash = []
+    page_token = None
+
+    while True:
+        resp = (
+            client.service.users()
+            .messages()
+            .list(userId="me", q=query, pageToken=page_token)
+            .execute()
+        )
+        msgs = resp.get("messages", [])
+        if msgs:
+            msgs_to_trash.extend([m["id"] for m in msgs])
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    if not msgs_to_trash:
+        print(json.dumps({"status": "success", "count": 0, "message": "No old emails found", "account": client.account_email}))
+        return
+
+    print(f"[{client.account_email}] Trashing {len(msgs_to_trash)} emails...", file=sys.stderr)
+
+    batch = client.service.new_batch_http_request()
+    count = 0
+    total = len(msgs_to_trash)
+
+    for mid in msgs_to_trash:
+        batch.add(client.service.users().messages().trash(userId="me", id=mid))
+        count += 1
+        if count % 50 == 0 or count == total:
+            batch.execute()
+            batch = client.service.new_batch_http_request()
+
+    print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+
+
+# =============================================================================
+# Filter Management
+# =============================================================================
+
+def cmd_filters_list(args):
+    """List all Gmail filters."""
+    client = get_client(args.account)
+
+    try:
+        results = client.service.users().settings().filters().list(userId="me").execute()
+        filters = results.get("filter", [])
+
+        if not filters:
+            print(json.dumps({"filters": [], "count": 0, "account": client.account_email}))
+            return
+
+        output = []
+        for f in filters:
+            criteria = f.get("criteria", {})
+            action = f.get("action", {})
+
+            filter_info = {
+                "id": f.get("id"),
+                "criteria": {
+                    "from": criteria.get("from"),
+                    "to": criteria.get("to"),
+                    "subject": criteria.get("subject"),
+                    "query": criteria.get("query"),
+                    "hasAttachment": criteria.get("hasAttachment"),
+                },
+                "action": {
+                    "addLabelIds": action.get("addLabelIds", []),
+                    "removeLabelIds": action.get("removeLabelIds", []),
+                    "forward": action.get("forward"),
+                },
+            }
+            # Remove None values
+            filter_info["criteria"] = {k: v for k, v in filter_info["criteria"].items() if v is not None}
+            filter_info["action"] = {k: v for k, v in filter_info["action"].items() if v}
+            output.append(filter_info)
+
+        print(json.dumps({"filters": output, "count": len(output), "account": client.account_email}, indent=2))
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_filters_add(args):
+    """Add a new Gmail filter."""
+    client = get_client(args.account)
+
+    # Build criteria
+    criteria = {}
+    if args.sender:
+        criteria["from"] = args.sender
+    if args.to:
+        criteria["to"] = args.to
+    if args.subject:
+        criteria["subject"] = args.subject
+    if args.query:
+        criteria["query"] = args.query
+    if args.has_attachment:
+        criteria["hasAttachment"] = True
+
+    if not criteria:
+        print(json.dumps({"error": "At least one criteria required", "account": client.account_email}))
+        return
+
+    # Build action
+    action = {}
+    if args.add_label:
+        label_id = ensure_label(client, args.add_label)
+        if label_id:
+            action["addLabelIds"] = [label_id]
+    if args.archive:
+        action["removeLabelIds"] = action.get("removeLabelIds", []) + ["INBOX"]
+    if args.mark_read:
+        action["removeLabelIds"] = action.get("removeLabelIds", []) + ["UNREAD"]
+    if args.trash:
+        action["addLabelIds"] = action.get("addLabelIds", []) + ["TRASH"]
+    if args.star:
+        action["addLabelIds"] = action.get("addLabelIds", []) + ["STARRED"]
+    if args.forward:
+        action["forward"] = args.forward
+
+    if not action:
+        print(json.dumps({"error": "At least one action required", "account": client.account_email}))
+        return
+
+    filter_body = {"criteria": criteria, "action": action}
+
+    try:
+        result = client.service.users().settings().filters().create(
+            userId="me", body=filter_body
+        ).execute()
+        print(json.dumps({"status": "success", "filter_id": result.get("id"), "account": client.account_email}))
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_filters_delete(args):
+    """Delete a Gmail filter by ID."""
+    client = get_client(args.account)
+
+    try:
+        client.service.users().settings().filters().delete(
+            userId="me", id=args.id
+        ).execute()
+        print(json.dumps({"status": "success", "deleted_id": args.id, "account": client.account_email}))
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+# =============================================================================
+# Attachment Operations
+# =============================================================================
+
+def cmd_attachments(args):
+    """List attachments in an email."""
+    client = get_client(args.account)
+
+    try:
+        msg = client.service.users().messages().get(
+            userId="me", id=args.id, format="full"
+        ).execute()
+
+        payload = msg.get("payload", {})
+        attachments = []
+
+        def find_attachments(parts):
+            for part in parts:
+                filename = part.get("filename", "")
+                if filename and part.get("body", {}).get("attachmentId"):
+                    attachments.append({
+                        "filename": filename,
+                        "mimeType": part.get("mimeType", ""),
+                        "attachmentId": part["body"]["attachmentId"],
+                        "size": part.get("body", {}).get("size", 0)
+                    })
+                if "parts" in part:
+                    find_attachments(part["parts"])
+
+        if "parts" in payload:
+            find_attachments(payload["parts"])
+
+        print(json.dumps({
+            "message_id": args.id,
+            "attachments": attachments,
+            "count": len(attachments),
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_download(args):
+    """Download attachments from an email."""
+    client = get_client(args.account)
+
+    # Ensure output directory exists
+    output_dir = args.output if args.output else "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        msg = client.service.users().messages().get(
+            userId="me", id=args.id, format="full"
+        ).execute()
+
+        payload = msg.get("payload", {})
+        downloaded = []
+
+        def download_parts(parts):
+            for part in parts:
+                filename = part.get("filename", "")
+                attachment_id = part.get("body", {}).get("attachmentId")
+
+                if filename and attachment_id:
+                    # Apply filename filter if specified
+                    if args.filename and args.filename.lower() not in filename.lower():
+                        continue
+
+                    try:
+                        attachment = client.service.users().messages().attachments().get(
+                            userId="me", messageId=args.id, id=attachment_id
+                        ).execute()
+
+                        data = attachment.get("data", "")
+                        if data:
+                            file_data = base64.urlsafe_b64decode(data)
+
+                            # Sanitize filename
+                            safe_filename = filename.replace("/", "_").replace("\\", "_")
+
+                            # Add prefix if specified
+                            if args.prefix:
+                                safe_filename = f"{args.prefix}_{safe_filename}"
+
+                            filepath = os.path.join(output_dir, safe_filename)
+
+                            # Handle duplicate filenames
+                            base, ext = os.path.splitext(filepath)
+                            counter = 1
+                            while os.path.exists(filepath):
+                                filepath = f"{base}_{counter}{ext}"
+                                counter += 1
+
+                            with open(filepath, "wb") as f:
+                                f.write(file_data)
+
+                            downloaded.append({
+                                "filename": filename,
+                                "saved_as": filepath,
+                                "size": len(file_data)
+                            })
+                    except Exception as e:
+                        downloaded.append({
+                            "filename": filename,
+                            "error": str(e)
+                        })
+
+                if "parts" in part:
+                    download_parts(part["parts"])
+
+        if "parts" in payload:
+            download_parts(payload["parts"])
+
+        print(json.dumps({
+            "status": "success",
+            "message_id": args.id,
+            "downloaded": downloaded,
+            "count": len([d for d in downloaded if "saved_as" in d]),
+            "output_dir": output_dir,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_search_download(args):
+    """Search emails and download attachments matching criteria."""
+    client = get_client(args.account)
+
+    # Ensure output directory exists
+    output_dir = args.output if args.output else "."
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        # Search for emails
+        response = client.service.users().messages().list(
+            userId="me", q=args.query, maxResults=args.limit
+        ).execute()
+
+        messages = response.get("messages", [])
+        all_downloaded = []
+        emails_with_attachments = []
+
+        for msg_info in messages:
+            msg_id = msg_info["id"]
+
+            msg = client.service.users().messages().get(
+                userId="me", id=msg_id, format="full"
+            ).execute()
+
+            payload = msg.get("payload", {})
+            headers = payload.get("headers", [])
+
+            subject = next(
+                (h["value"] for h in headers if h["name"].lower() == "subject"),
+                "No Subject"
+            )
+            sender = next(
+                (h["value"] for h in headers if h["name"].lower() == "from"),
+                "Unknown"
+            )
+            date = next(
+                (h["value"] for h in headers if h["name"].lower() == "date"),
+                ""
+            )
+
+            # Parse year from date
+            year = None
+            try:
+                year_match = re.search(r'\b(20\d{2})\b', date)
+                if year_match:
+                    year = int(year_match.group(1))
+            except:
+                pass
+
+            def download_parts(parts):
+                downloaded = []
+                for part in parts:
+                    filename = part.get("filename", "")
+                    attachment_id = part.get("body", {}).get("attachmentId")
+
+                    if filename and attachment_id:
+                        try:
+                            attachment = client.service.users().messages().attachments().get(
+                                userId="me", messageId=msg_id, id=attachment_id
+                            ).execute()
+
+                            data = attachment.get("data", "")
+                            if data:
+                                file_data = base64.urlsafe_b64decode(data)
+
+                                # Sanitize filename with account prefix
+                                safe_filename = f"{client.account_name}_{filename}".replace("/", "_").replace("\\", "_")
+                                filepath = os.path.join(output_dir, safe_filename)
+
+                                # Handle duplicate filenames
+                                base, ext = os.path.splitext(filepath)
+                                counter = 1
+                                while os.path.exists(filepath):
+                                    filepath = f"{base}_{counter}{ext}"
+                                    counter += 1
+
+                                with open(filepath, "wb") as f:
+                                    f.write(file_data)
+
+                                downloaded.append({
+                                    "filename": filename,
+                                    "saved_as": filepath,
+                                    "size": len(file_data),
+                                    "email_subject": subject,
+                                    "email_date": date,
+                                    "year": year
+                                })
+                        except Exception as e:
+                            downloaded.append({
+                                "filename": filename,
+                                "error": str(e)
+                            })
+
+                    if "parts" in part:
+                        downloaded.extend(download_parts(part["parts"]))
+                return downloaded
+
+            if "parts" in payload:
+                downloaded = download_parts(payload["parts"])
+                if downloaded:
+                    all_downloaded.extend(downloaded)
+                    emails_with_attachments.append({
+                        "id": msg_id,
+                        "subject": subject,
+                        "from": sender,
+                        "date": date,
+                        "year": year,
+                        "attachments": [d["filename"] for d in downloaded if "filename" in d]
+                    })
+
+        print(json.dumps({
+            "status": "success",
+            "query": args.query,
+            "emails_searched": len(messages),
+            "emails_with_attachments": len(emails_with_attachments),
+            "total_downloaded": len([d for d in all_downloaded if "saved_as" in d]),
+            "output_dir": output_dir,
+            "downloaded_files": all_downloaded,
+            "emails": emails_with_attachments,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+# =============================================================================
+# Send Email
+# =============================================================================
+
+def cmd_send(args):
+    """Send an email."""
+    client = get_client(args.account)
+
+    try:
+        # Create message
+        if args.attachment:
+            message = MIMEMultipart()
+            message.attach(MIMEText(args.body, "plain"))
+
+            # Attach files
+            for filepath in args.attachment:
+                if os.path.exists(filepath):
+                    filename = os.path.basename(filepath)
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = "application/octet-stream"
+
+                    main_type, sub_type = mime_type.split("/", 1)
+
+                    with open(filepath, "rb") as f:
+                        attachment = MIMEBase(main_type, sub_type)
+                        attachment.set_payload(f.read())
+
+                    encoders.encode_base64(attachment)
+                    attachment.add_header(
+                        "Content-Disposition",
+                        "attachment",
+                        filename=filename
+                    )
+                    message.attach(attachment)
+                else:
+                    print(json.dumps({
+                        "error": f"Attachment not found: {filepath}",
+                        "account": client.account_email
+                    }))
+                    return
+        else:
+            message = MIMEText(args.body, "plain")
+
+        message["to"] = args.to
+        message["subject"] = args.subject
+
+        if args.cc:
+            message["cc"] = args.cc
+        if args.bcc:
+            message["bcc"] = args.bcc
+        if args.reply_to:
+            message["reply-to"] = args.reply_to
+
+        # Encode and send
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+        result = client.service.users().messages().send(
+            userId="me",
+            body={"raw": raw}
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "message_id": result.get("id"),
+            "thread_id": result.get("threadId"),
+            "to": args.to,
+            "subject": args.subject,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_reply(args):
+    """Reply to an email."""
+    client = get_client(args.account)
+
+    try:
+        # Get original message
+        original = client.service.users().messages().get(
+            userId="me", id=args.id, format="full"
+        ).execute()
+
+        payload = original.get("payload", {})
+        headers = payload.get("headers", [])
+
+        # Extract headers
+        original_subject = next(
+            (h["value"] for h in headers if h["name"].lower() == "subject"),
+            ""
+        )
+        original_from = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"),
+            ""
+        )
+        message_id = next(
+            (h["value"] for h in headers if h["name"].lower() == "message-id"),
+            ""
+        )
+        references = next(
+            (h["value"] for h in headers if h["name"].lower() == "references"),
+            ""
+        )
+
+        # Build reply subject
+        reply_subject = original_subject
+        if not reply_subject.lower().startswith("re:"):
+            reply_subject = f"Re: {reply_subject}"
+
+        # Create message
+        message = MIMEText(args.body, "plain")
+        message["to"] = original_from
+        message["subject"] = reply_subject
+        message["In-Reply-To"] = message_id
+        message["References"] = f"{references} {message_id}".strip()
+
+        # Encode and send
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+        result = client.service.users().messages().send(
+            userId="me",
+            body={
+                "raw": raw,
+                "threadId": original.get("threadId")
+            }
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "message_id": result.get("id"),
+            "thread_id": result.get("threadId"),
+            "to": original_from,
+            "subject": reply_subject,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def parse_ids(ids_input):
+    """Parse IDs from JSON array or comma-separated string."""
+    if not ids_input:
+        return []
+    if ids_input.startswith("["):
+        return json.loads(ids_input)
+    return ids_input.split(",")
+
+
+def ensure_label(client, label_name):
+    """Ensures a label exists, creating it if necessary."""
+    try:
+        results = client.service.users().labels().list(userId="me").execute()
+        labels = results.get("labels", [])
+
+        for label in labels:
+            if label["name"].lower() == label_name.lower():
+                return label["id"]
+
+        label_object = {
+            "name": label_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        }
+        created_label = (
+            client.service.users()
+            .labels()
+            .create(userId="me", body=label_object)
+            .execute()
+        )
+        return created_label["id"]
+    except Exception as e:
+        print(json.dumps({"error": f"Failed to ensure label: {str(e)}"}), file=sys.stderr)
+        return None
+
+
+# =============================================================================
+# CLI Setup
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Email CLI for email-copilot skill (multi-account)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Global account option
+    parser.add_argument("-a", "--account", help="Account name (from config.toml). Uses default if not specified.")
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # accounts
+    p_accounts = subparsers.add_parser("accounts", help="List configured accounts")
+    p_accounts.set_defaults(func=cmd_accounts)
+
+    # list
+    p_list = subparsers.add_parser("list", help="List emails")
+    p_list.add_argument("-n", "--limit", type=int, default=100, help="Max emails to fetch")
+    p_list.add_argument("-q", "--query", help="Gmail search query")
+    p_list.set_defaults(func=cmd_list)
+
+    # read
+    p_read = subparsers.add_parser("read", help="Read full email content")
+    p_read.add_argument("id", help="Email ID")
+    p_read.set_defaults(func=cmd_read)
+
+    # trash
+    p_trash = subparsers.add_parser("trash", help="Move emails to trash")
+    p_trash.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
+    p_trash.set_defaults(func=cmd_trash)
+
+    # untrash
+    p_untrash = subparsers.add_parser("untrash", help="Restore emails from trash")
+    p_untrash.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
+    p_untrash.set_defaults(func=cmd_untrash)
+
+    # move
+    p_move = subparsers.add_parser("move", help="Move emails to a label")
+    p_move.add_argument("label", help="Target label name")
+    p_move.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
+    p_move.add_argument("-r", "--read", action="store_true", help="Also mark as read")
+    p_move.set_defaults(func=cmd_move)
+
+    # summary
+    p_summary = subparsers.add_parser("summary", help="Get email content for summarization")
+    p_summary.add_argument("label", help="Label name")
+    p_summary.add_argument("-n", "--limit", type=int, default=20, help="Max emails")
+    p_summary.set_defaults(func=cmd_summary)
+
+    # cleanup
+    p_cleanup = subparsers.add_parser("cleanup", help="Delete old emails from a label")
+    p_cleanup.add_argument("label", help="Label name")
+    p_cleanup.add_argument("-d", "--days", type=int, default=30, help="Days threshold")
+    p_cleanup.set_defaults(func=cmd_cleanup)
+
+    # filters
+    p_filters = subparsers.add_parser("filters", help="Manage Gmail filters")
+    filters_sub = p_filters.add_subparsers(dest="filters_cmd")
+
+    p_filters_list = filters_sub.add_parser("list", help="List all filters")
+    p_filters_list.set_defaults(func=cmd_filters_list)
+
+    p_filters_add = filters_sub.add_parser("add", help="Add a new filter")
+    p_filters_add.add_argument("--from", dest="sender", help="Filter by sender")
+    p_filters_add.add_argument("--to", help="Filter by recipient")
+    p_filters_add.add_argument("--subject", help="Filter by subject")
+    p_filters_add.add_argument("--query", help="Gmail search query")
+    p_filters_add.add_argument("--has-attachment", action="store_true")
+    p_filters_add.add_argument("--add-label", help="Add label")
+    p_filters_add.add_argument("--archive", action="store_true")
+    p_filters_add.add_argument("--mark-read", action="store_true")
+    p_filters_add.add_argument("--trash", action="store_true")
+    p_filters_add.add_argument("--star", action="store_true")
+    p_filters_add.add_argument("--forward", help="Forward to email")
+    p_filters_add.set_defaults(func=cmd_filters_add)
+
+    p_filters_delete = filters_sub.add_parser("delete", help="Delete a filter")
+    p_filters_delete.add_argument("id", help="Filter ID")
+    p_filters_delete.set_defaults(func=cmd_filters_delete)
+
+    # attachments - list attachments in an email
+    p_attachments = subparsers.add_parser("attachments", help="List attachments in an email")
+    p_attachments.add_argument("id", help="Email ID")
+    p_attachments.set_defaults(func=cmd_attachments)
+
+    # download - download attachments from an email
+    p_download = subparsers.add_parser("download", help="Download attachments from an email")
+    p_download.add_argument("id", help="Email ID")
+    p_download.add_argument("-o", "--output", help="Output directory (default: current dir)")
+    p_download.add_argument("-f", "--filename", help="Filter by filename (partial match)")
+    p_download.add_argument("-p", "--prefix", help="Add prefix to saved filenames")
+    p_download.set_defaults(func=cmd_download)
+
+    # search-download - search and download attachments
+    p_search_download = subparsers.add_parser("search-download", help="Search emails and download attachments")
+    p_search_download.add_argument("-q", "--query", required=True, help="Gmail search query")
+    p_search_download.add_argument("-o", "--output", help="Output directory (default: current dir)")
+    p_search_download.add_argument("-n", "--limit", type=int, default=100, help="Max emails to search")
+    p_search_download.set_defaults(func=cmd_search_download)
+
+    # send - send an email
+    p_send = subparsers.add_parser("send", help="Send an email")
+    p_send.add_argument("--to", required=True, help="Recipient email")
+    p_send.add_argument("--subject", required=True, help="Email subject")
+    p_send.add_argument("--body", required=True, help="Email body")
+    p_send.add_argument("--cc", help="CC recipients (comma-separated)")
+    p_send.add_argument("--bcc", help="BCC recipients (comma-separated)")
+    p_send.add_argument("--reply-to", help="Reply-to address")
+    p_send.add_argument("--attachment", action="append", help="File path to attach (can be used multiple times)")
+    p_send.set_defaults(func=cmd_send)
+
+    # reply - reply to an email
+    p_reply = subparsers.add_parser("reply", help="Reply to an email")
+    p_reply.add_argument("id", help="Original email ID to reply to")
+    p_reply.add_argument("--body", required=True, help="Reply body")
+    p_reply.set_defaults(func=cmd_reply)
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == "filters" and not args.filters_cmd:
+        p_filters.print_help()
+        sys.exit(1)
+
+    # For accounts command, no account needed
+    if args.command == "accounts":
+        args.func(args)
+        return
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

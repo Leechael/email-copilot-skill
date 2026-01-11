@@ -1,0 +1,32 @@
+# Email Copilot Configuration
+# Copy this file to config.toml and customize
+
+[gmail]
+# OAuth scopes required for the skill
+scopes = ["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/gmail.settings.basic"]
+
+# Default search query when listing emails
+default_query = "is:unread"
+
+# Default account to use (must match an account name below)
+default_account = "default"
+
+# =============================================================================
+# Account Configuration
+# =============================================================================
+# Add accounts by running: python gmail_client.py --auth <name>
+# The email field will be auto-filled after authentication
+
+[accounts.default]
+token_path = "tokens/default.json"
+# email = "your@gmail.com"  # Auto-filled after authentication
+
+# Example: Add a work account
+# [accounts.work]
+# token_path = "tokens/work.json"
+# email = "your@company.com"
+
+# Example: Add a personal account
+# [accounts.personal]
+# token_path = "tokens/personal.json"
+# email = "personal@gmail.com"

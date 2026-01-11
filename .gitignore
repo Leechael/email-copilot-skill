@@ -1,0 +1,11 @@
+# User-specific configuration
+config.toml
+credentials.json
+rules.md
+
+# OAuth tokens
+tokens/
+
+# Python cache
+__pycache__/
+*.py[cod]
