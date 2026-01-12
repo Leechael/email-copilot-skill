@@ -950,6 +950,252 @@ def cmd_reply(args):
 
 
 # =============================================================================
+# Draft Operations
+# =============================================================================
+
+def cmd_draft(args):
+    """Create a new draft email."""
+    client = get_client(args.account)
+
+    try:
+        # Create message
+        if args.attachment:
+            message = MIMEMultipart()
+            message.attach(MIMEText(args.body, "plain"))
+
+            for filepath in args.attachment:
+                if os.path.exists(filepath):
+                    filename = os.path.basename(filepath)
+                    mime_type, _ = mimetypes.guess_type(filepath)
+                    if mime_type is None:
+                        mime_type = "application/octet-stream"
+
+                    main_type, sub_type = mime_type.split("/", 1)
+
+                    with open(filepath, "rb") as f:
+                        attachment = MIMEBase(main_type, sub_type)
+                        attachment.set_payload(f.read())
+
+                    encoders.encode_base64(attachment)
+                    attachment.add_header(
+                        "Content-Disposition",
+                        "attachment",
+                        filename=filename
+                    )
+                    message.attach(attachment)
+                else:
+                    print(json.dumps({
+                        "error": f"Attachment not found: {filepath}",
+                        "account": client.account_email
+                    }))
+                    return
+        else:
+            message = MIMEText(args.body, "plain")
+
+        message["to"] = args.to
+        message["subject"] = args.subject
+
+        if args.cc:
+            message["cc"] = args.cc
+        if args.bcc:
+            message["bcc"] = args.bcc
+
+        # Encode and create draft
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+        result = client.service.users().drafts().create(
+            userId="me",
+            body={"message": {"raw": raw}}
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "draft_id": result.get("id"),
+            "message_id": result.get("message", {}).get("id"),
+            "to": args.to,
+            "subject": args.subject,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_draft_reply(args):
+    """Create a draft reply to an existing email."""
+    client = get_client(args.account)
+
+    try:
+        # Get original message
+        original = client.service.users().messages().get(
+            userId="me", id=args.id, format="full"
+        ).execute()
+
+        payload = original.get("payload", {})
+        headers = payload.get("headers", [])
+
+        # Extract headers
+        original_subject = next(
+            (h["value"] for h in headers if h["name"].lower() == "subject"),
+            ""
+        )
+        original_from = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"),
+            ""
+        )
+        message_id = next(
+            (h["value"] for h in headers if h["name"].lower() == "message-id"),
+            ""
+        )
+        references = next(
+            (h["value"] for h in headers if h["name"].lower() == "references"),
+            ""
+        )
+
+        # Build reply subject
+        reply_subject = original_subject
+        if not reply_subject.lower().startswith("re:"):
+            reply_subject = f"Re: {reply_subject}"
+
+        # Create message
+        message = MIMEText(args.body, "plain")
+        message["to"] = original_from
+        message["subject"] = reply_subject
+        message["In-Reply-To"] = message_id
+        message["References"] = f"{references} {message_id}".strip()
+
+        # Encode and create draft
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+        result = client.service.users().drafts().create(
+            userId="me",
+            body={
+                "message": {
+                    "raw": raw,
+                    "threadId": original.get("threadId")
+                }
+            }
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "draft_id": result.get("id"),
+            "message_id": result.get("message", {}).get("id"),
+            "thread_id": original.get("threadId"),
+            "to": original_from,
+            "subject": reply_subject,
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_drafts_list(args):
+    """List all drafts."""
+    client = get_client(args.account)
+
+    try:
+        result = client.service.users().drafts().list(
+            userId="me", maxResults=args.limit
+        ).execute()
+
+        drafts = result.get("drafts", [])
+
+        if not drafts:
+            print(json.dumps({"drafts": [], "count": 0, "account": client.account_email}))
+            return
+
+        output = []
+        for draft in drafts:
+            draft_id = draft.get("id")
+            msg = draft.get("message", {})
+            msg_id = msg.get("id")
+
+            # Get full message details
+            try:
+                full_msg = client.service.users().messages().get(
+                    userId="me", id=msg_id, format="metadata",
+                    metadataHeaders=["Subject", "To", "Date"]
+                ).execute()
+
+                headers = full_msg.get("payload", {}).get("headers", [])
+                subject = next(
+                    (h["value"] for h in headers if h["name"].lower() == "subject"),
+                    "No Subject"
+                )
+                to = next(
+                    (h["value"] for h in headers if h["name"].lower() == "to"),
+                    ""
+                )
+                date = next(
+                    (h["value"] for h in headers if h["name"].lower() == "date"),
+                    ""
+                )
+
+                output.append({
+                    "draft_id": draft_id,
+                    "message_id": msg_id,
+                    "subject": subject,
+                    "to": to,
+                    "date": date
+                })
+            except:
+                output.append({
+                    "draft_id": draft_id,
+                    "message_id": msg_id
+                })
+
+        print(json.dumps({
+            "drafts": output,
+            "count": len(output),
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_draft_delete(args):
+    """Delete a draft."""
+    client = get_client(args.account)
+
+    try:
+        client.service.users().drafts().delete(
+            userId="me", id=args.id
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "deleted_draft_id": args.id,
+            "account": client.account_email
+        }))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+def cmd_draft_send(args):
+    """Send an existing draft."""
+    client = get_client(args.account)
+
+    try:
+        result = client.service.users().drafts().send(
+            userId="me", body={"id": args.id}
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "message_id": result.get("id"),
+            "thread_id": result.get("threadId"),
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"error": str(e), "account": client.account_email}))
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -1110,6 +1356,41 @@ def main():
     p_reply.add_argument("--body", required=True, help="Reply body")
     p_reply.set_defaults(func=cmd_reply)
 
+    # drafts - manage drafts
+    p_drafts = subparsers.add_parser("drafts", help="Manage email drafts")
+    drafts_sub = p_drafts.add_subparsers(dest="drafts_cmd")
+
+    # drafts list
+    p_drafts_list = drafts_sub.add_parser("list", help="List all drafts")
+    p_drafts_list.add_argument("-n", "--limit", type=int, default=20, help="Max drafts to fetch")
+    p_drafts_list.set_defaults(func=cmd_drafts_list)
+
+    # drafts create
+    p_drafts_create = drafts_sub.add_parser("create", help="Create a new draft")
+    p_drafts_create.add_argument("--to", required=True, help="Recipient email")
+    p_drafts_create.add_argument("--subject", required=True, help="Email subject")
+    p_drafts_create.add_argument("--body", required=True, help="Email body")
+    p_drafts_create.add_argument("--cc", help="CC recipients")
+    p_drafts_create.add_argument("--bcc", help="BCC recipients")
+    p_drafts_create.add_argument("--attachment", action="append", help="File to attach")
+    p_drafts_create.set_defaults(func=cmd_draft)
+
+    # drafts reply - create a draft reply
+    p_drafts_reply = drafts_sub.add_parser("reply", help="Create a draft reply to an email")
+    p_drafts_reply.add_argument("id", help="Original email ID to reply to")
+    p_drafts_reply.add_argument("--body", required=True, help="Reply body")
+    p_drafts_reply.set_defaults(func=cmd_draft_reply)
+
+    # drafts delete
+    p_drafts_delete = drafts_sub.add_parser("delete", help="Delete a draft")
+    p_drafts_delete.add_argument("id", help="Draft ID to delete")
+    p_drafts_delete.set_defaults(func=cmd_draft_delete)
+
+    # drafts send
+    p_drafts_send = drafts_sub.add_parser("send", help="Send an existing draft")
+    p_drafts_send.add_argument("id", help="Draft ID to send")
+    p_drafts_send.set_defaults(func=cmd_draft_send)
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1118,6 +1399,10 @@ def main():
 
     if args.command == "filters" and not args.filters_cmd:
         p_filters.print_help()
+        sys.exit(1)
+
+    if args.command == "drafts" and not args.drafts_cmd:
+        p_drafts.print_help()
         sys.exit(1)
 
     # For accounts command, no account needed

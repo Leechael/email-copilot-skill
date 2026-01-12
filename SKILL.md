@@ -138,6 +138,30 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg
 #   reply abc123 --body "Thanks for your message!"
 ```
 
+### Drafts
+
+```bash
+# List all drafts
+python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts list [-n LIMIT]
+
+# Create a new draft
+python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts create --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
+
+# Create a draft reply to an existing email
+python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts reply <msg_id> --body BODY
+
+# Delete a draft
+python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts delete <draft_id>
+
+# Send an existing draft
+python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts send <draft_id>
+```
+
+**Workflow**: When user asks to "save draft" or review before sending:
+1. Use `drafts reply` or `drafts create` to save to Gmail
+2. User can review/edit in Gmail web interface
+3. Use `drafts send` when ready, or user sends manually
+
 ### Gmail Filters
 
 Filters are account-specific. Always specify account when managing filters.
