@@ -9,10 +9,14 @@ Act as a proactive executive assistant for the user's inbox. Filter noise based 
 
 ## First-Time Setup
 
-Before using this skill, check if setup is complete by running:
+Before using this skill, install dependencies and check if setup is complete:
 
 ```bash
-python .claude/skills/email-copilot/gmail_client.py --check
+# Install dependencies (one-time)
+cd .claude/skills/email-copilot && uv sync && cd -
+
+# Check setup status
+uv run --project .claude/skills/email-copilot uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --check
 ```
 
 If `ready: false`, guide the user through setup by reading the README:
@@ -24,11 +28,12 @@ cat .claude/skills/email-copilot/README.md
 
 **Quick Setup Steps:**
 
-1. **Google API Credentials**: User needs to create OAuth credentials in Google Cloud Console
-2. **Copy credentials**: Save as `.claude/skills/email-copilot/credentials.json`
-3. **Create config**: Copy `config.toml.example` to `config.toml`
-4. **Authenticate**: Run `python .claude/skills/email-copilot/gmail_client.py --auth default`
-5. **Create rules**: Copy `rules.md.example` to `rules.md` and customize
+1. **Install deps**: `cd .claude/skills/email-copilot && uv sync`
+2. **Google API Credentials**: User needs to create OAuth credentials in Google Cloud Console
+3. **Copy credentials**: Save as `.claude/skills/email-copilot/credentials.json`
+4. **Create config**: Copy `config.toml.example` to `config.toml`
+5. **Authenticate**: Run `uv run --project .claude/skills/email-copilot uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth default`
+6. **Create rules**: Copy `rules.md.example` to `rules.md` and customize
 
 ## Multi-Account Support
 
@@ -40,11 +45,11 @@ This skill supports multiple Gmail accounts. Each operation outputs the account 
 
 ```bash
 # List all configured accounts
-python .claude/skills/email-copilot/scripts/email_cli.py accounts
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py accounts
 
 # Use specific account (add -a before command)
-python .claude/skills/email-copilot/scripts/email_cli.py -a work list -n 100
-python .claude/skills/email-copilot/scripts/email_cli.py -a personal list -n 100
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py -a work list -n 100
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py -a personal list -n 100
 
 # Without -a, uses default account from config.toml
 ```
@@ -57,19 +62,19 @@ Unified CLI at `.claude/skills/email-copilot/scripts/email_cli.py`. Run from any
 
 ```bash
 # List configured accounts
-python .claude/skills/email-copilot/gmail_client.py
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py
 
 # Add and authenticate an account
-python .claude/skills/email-copilot/gmail_client.py --auth work
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth work
 
 # Set default account
-python .claude/skills/email-copilot/gmail_client.py --set-default work
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --set-default work
 
 # Remove an account
-python .claude/skills/email-copilot/gmail_client.py --remove work
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --remove work
 
 # Check setup status (JSON output)
-python .claude/skills/email-copilot/gmail_client.py --check
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --check
 ```
 
 ### Email Operations
@@ -78,7 +83,7 @@ All outputs include `account` field to identify which mailbox the emails belong 
 
 ```bash
 # List emails (default: INBOX)
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] list [-n LIMIT] [-q QUERY]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] list [-n LIMIT] [-q QUERY]
 
 # Examples:
 #   list -n 200                          # List 200 emails from default account
@@ -86,26 +91,26 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] list [-n L
 #   -a personal list -q "from:amazon"    # List Amazon emails from personal
 
 # Read full email content
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] read <msg_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] read <msg_id>
 
 # Trash emails
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] trash '<json_id_list>'
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] trash '<json_id_list>'
 
 # Restore from trash
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] untrash '<json_id_list>'
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] untrash '<json_id_list>'
 
 # Move emails to label (with optional mark-as-read)
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] move <label> '<json_id_list>' [-r]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] move <label> '<json_id_list>' [-r]
 ```
 
 ### Attachments
 
 ```bash
 # List attachments in an email
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] attachments <msg_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] attachments <msg_id>
 
 # Download attachments from a specific email
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] download <msg_id> [-o OUTPUT_DIR] [-f FILENAME_FILTER] [-p PREFIX]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] download <msg_id> [-o OUTPUT_DIR] [-f FILENAME_FILTER] [-p PREFIX]
 
 # Examples:
 #   download abc123 -o ./downloads           # Download to ./downloads
@@ -113,7 +118,7 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] download <
 #   download abc123 -p "invoice"             # Prefix files with "invoice_"
 
 # Search emails and download all attachments
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] search-download -q QUERY [-o OUTPUT_DIR] [-n LIMIT]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] search-download -q QUERY [-o OUTPUT_DIR] [-n LIMIT]
 
 # Examples:
 #   search-download -q "from:anthropic invoice" -o ./invoices -n 50
@@ -124,7 +129,7 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] search-dow
 
 ```bash
 # Send a new email
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] send --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] send --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
 
 # Examples:
 #   send --to "user@example.com" --subject "Hello" --body "Hi there!"
@@ -132,7 +137,7 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] send --to 
 #   send --to "user@example.com" --subject "Files" --body "Multiple files" --attachment ./a.pdf --attachment ./b.pdf
 
 # Reply to an email
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg_id> --body BODY
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg_id> --body BODY
 
 # Example:
 #   reply abc123 --body "Thanks for your message!"
@@ -142,19 +147,19 @@ python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg
 
 ```bash
 # List all drafts
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts list [-n LIMIT]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts list [-n LIMIT]
 
 # Create a new draft
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts create --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts create --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
 
 # Create a draft reply to an existing email
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts reply <msg_id> --body BODY
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts reply <msg_id> --body BODY
 
 # Delete a draft
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts delete <draft_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts delete <draft_id>
 
 # Send an existing draft
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts send <draft_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts send <draft_id>
 ```
 
 **Workflow**: When user asks to "save draft" or review before sending:
@@ -168,26 +173,26 @@ Filters are account-specific. Always specify account when managing filters.
 
 ```bash
 # List all filters
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters list
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters list
 
 # Add a new filter
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters add [criteria] [actions]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters add [criteria] [actions]
 
 # Criteria: --from, --to, --subject, --query, --has-attachment
 # Actions: --add-label, --archive, --mark-read, --trash, --star, --forward
 
 # Delete a filter
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters delete <filter_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] filters delete <filter_id>
 ```
 
 ### Maintenance
 
 ```bash
 # Get email content for summarization
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] summary <label> [-n LIMIT]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] summary <label> [-n LIMIT]
 
 # Delete old emails from a label
-python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] cleanup <label> [-d DAYS]
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] cleanup <label> [-d DAYS]
 ```
 
 **Periodic cleanup** (run for each account at end of session):
@@ -295,6 +300,7 @@ All files are self-contained within the skill directory:
 .claude/skills/email-copilot/
 ├── SKILL.md              # This file - skill instructions
 ├── README.md             # Detailed setup guide
+├── pyproject.toml        # Python dependencies (for uv)
 ├── gmail_client.py       # Account manager & Gmail client
 ├── config.toml           # Multi-account configuration (user-specific)
 ├── config.toml.example   # Configuration template

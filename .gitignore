@@ -9,3 +9,7 @@ tokens/
 # Python cache
 __pycache__/
 *.py[cod]
+
+# uv
+.venv/
+uv.lock

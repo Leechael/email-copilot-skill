@@ -1,0 +1,21 @@
+[project]
+name = "email-copilot"
+version = "0.1.0"
+description = "A Claude Code skill for intelligent Gmail inbox management"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "google-auth>=2.0.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-api-python-client>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "tomlkit>=0.12.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]

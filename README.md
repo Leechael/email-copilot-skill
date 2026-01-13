@@ -13,18 +13,19 @@ A Claude Code skill for intelligent Gmail inbox management with multi-account su
 
 ## Setup
 
-### 1. Install Python Dependencies
+### 1. Install Dependencies
 
-This skill requires Python 3.11+ and the following packages:
+This skill requires Python 3.11+. Install dependencies using uv:
 
 ```bash
-pip install google-auth google-auth-oauthlib google-api-python-client python-dotenv tomlkit
+cd .claude/skills/email-copilot
+uv sync
 ```
 
-Or if using pdm/poetry, add to your project:
+Or install globally:
 
 ```bash
-pdm add google-auth google-auth-oauthlib google-api-python-client python-dotenv tomlkit
+uv pip install -e .claude/skills/email-copilot
 ```
 
 ### 2. Google API Credentials
@@ -66,7 +67,7 @@ Edit `config.toml` to add your accounts (email will be auto-filled after authent
 Run the authentication flow for your first account:
 
 ```bash
-python .claude/skills/email-copilot/gmail_client.py --auth default
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth default
 ```
 
 This will:
@@ -77,8 +78,8 @@ This will:
 Add more accounts:
 
 ```bash
-python .claude/skills/email-copilot/gmail_client.py --auth work
-python .claude/skills/email-copilot/gmail_client.py --auth personal
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth work
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth personal
 ```
 
 ### 5. Rules Configuration
@@ -96,87 +97,94 @@ Edit `rules.md` to define:
 
 ## Usage
 
+All commands use `uv run` to ensure correct dependencies:
+
+```bash
+# Shorthand for all commands below
+UV="uv run --project .claude/skills/email-copilot python"
+```
+
 ### Check Setup Status
 
 ```bash
-python .claude/skills/email-copilot/gmail_client.py --check
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --check
 ```
 
 ### Account Management
 
 ```bash
 # List all accounts
-python .claude/skills/email-copilot/gmail_client.py
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py
 
 # Set default account
-python .claude/skills/email-copilot/gmail_client.py --set-default work
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --set-default work
 
 # Remove an account
-python .claude/skills/email-copilot/gmail_client.py --remove old-account
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --remove old-account
 ```
 
 ### Email Operations
 
 ```bash
 # List emails
-python .claude/skills/email-copilot/scripts/email_cli.py list -n 100
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py list -n 100
 
 # List from specific account
-python .claude/skills/email-copilot/scripts/email_cli.py -a work list -n 100
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py -a work list -n 100
 
 # Search emails
-python .claude/skills/email-copilot/scripts/email_cli.py list -q "from:github.com is:unread"
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py list -q "from:github.com is:unread"
 
 # Read email
-python .claude/skills/email-copilot/scripts/email_cli.py read <msg_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py read <msg_id>
 
 # Trash emails
-python .claude/skills/email-copilot/scripts/email_cli.py trash '["id1","id2"]'
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py trash '["id1","id2"]'
 
 # Move emails to label
-python .claude/skills/email-copilot/scripts/email_cli.py move "Archive" '["id1"]' -r
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py move "Archive" '["id1"]' -r
 ```
 
 ### Send & Reply
 
 ```bash
 # Send email
-python .claude/skills/email-copilot/scripts/email_cli.py send \
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py send \
     --to "user@example.com" \
     --subject "Hello" \
     --body "Message body"
 
 # Reply to email
-python .claude/skills/email-copilot/scripts/email_cli.py reply <msg_id> --body "Reply text"
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py reply <msg_id> --body "Reply text"
 ```
 
 ### Attachments
 
 ```bash
 # List attachments
-python .claude/skills/email-copilot/scripts/email_cli.py attachments <msg_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py attachments <msg_id>
 
 # Download attachments
-python .claude/skills/email-copilot/scripts/email_cli.py download <msg_id> -o ./downloads
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py download <msg_id> -o ./downloads
 
 # Bulk download from search
-python .claude/skills/email-copilot/scripts/email_cli.py search-download -q "from:anthropic invoice" -o ./invoices
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py search-download -q "from:anthropic invoice" -o ./invoices
 ```
 
 ### Gmail Filters
 
 ```bash
 # List filters
-python .claude/skills/email-copilot/scripts/email_cli.py filters list
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py filters list
 
 # Add filter
-python .claude/skills/email-copilot/scripts/email_cli.py filters add \
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py filters add \
     --from "newsletter@example.com" \
     --add-label "Newsletters" \
     --archive --mark-read
 
 # Delete filter
-python .claude/skills/email-copilot/scripts/email_cli.py filters delete <filter_id>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py filters delete <filter_id>
 ```
 
 ## File Structure
@@ -185,6 +193,7 @@ python .claude/skills/email-copilot/scripts/email_cli.py filters delete <filter_
 .claude/skills/email-copilot/
 ├── SKILL.md              # Skill instructions for Claude
 ├── README.md             # This file
+├── pyproject.toml        # Python dependencies (for uv)
 ├── gmail_client.py       # Gmail client & account manager
 ├── config.toml           # Your configuration (gitignored)
 ├── config.toml.example   # Configuration template
@@ -205,14 +214,17 @@ Make sure `credentials.json` is in the skill directory (`.claude/skills/email-co
 
 ### "Account not found in config.toml"
 
-Run authentication first: `python gmail_client.py --auth <account_name>`
+Run authentication first:
+```bash
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth <account_name>
+```
 
 ### "Token expired" or authentication errors
 
 Delete the token file and re-authenticate:
 ```bash
 rm .claude/skills/email-copilot/tokens/<account>.json
-python .claude/skills/email-copilot/gmail_client.py --auth <account>
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/gmail_client.py --auth <account>
 ```
 
 ### "Access blocked" during OAuth
