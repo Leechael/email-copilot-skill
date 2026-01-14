@@ -187,6 +187,9 @@ def cmd_read(args):
         sender = next(
             (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
         )
+        reply_to = next(
+            (h["value"] for h in headers if h["name"].lower() == "reply-to"), None
+        )
 
         body = ""
         if "parts" in payload:
@@ -205,7 +208,11 @@ def cmd_read(args):
             body = msg.get("snippet", "")
 
         print(f"Account: {client.account_email} ({client.account_name})")
-        print(f"Subject: {subject}\nFrom: {sender}\n{'-' * 40}\n{body}")
+        print(f"Subject: {subject}")
+        print(f"From: {sender}")
+        if reply_to:
+            print(f"Reply-To: {reply_to}")
+        print(f"{'-' * 40}\n{body}")
 
     except Exception as e:
         print(json.dumps({"error": str(e)}))
@@ -904,6 +911,13 @@ def cmd_reply(args):
             (h["value"] for h in headers if h["name"].lower() == "from"),
             ""
         )
+        # Check Reply-To header first, fall back to From
+        reply_to = next(
+            (h["value"] for h in headers if h["name"].lower() == "reply-to"),
+            None
+        )
+        recipient = reply_to if reply_to else original_from
+
         message_id = next(
             (h["value"] for h in headers if h["name"].lower() == "message-id"),
             ""
@@ -920,10 +934,13 @@ def cmd_reply(args):
 
         # Create message
         message = MIMEText(args.body, "plain")
-        message["to"] = original_from
+        message["to"] = recipient
         message["subject"] = reply_subject
         message["In-Reply-To"] = message_id
         message["References"] = f"{references} {message_id}".strip()
+
+        if args.cc:
+            message["cc"] = args.cc
 
         # Encode and send
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
@@ -940,7 +957,7 @@ def cmd_reply(args):
             "status": "success",
             "message_id": result.get("id"),
             "thread_id": result.get("threadId"),
-            "to": original_from,
+            "to": recipient,
             "subject": reply_subject,
             "account": client.account_email
         }, indent=2))
@@ -1043,6 +1060,13 @@ def cmd_draft_reply(args):
             (h["value"] for h in headers if h["name"].lower() == "from"),
             ""
         )
+        # Check Reply-To header first, fall back to From
+        reply_to = next(
+            (h["value"] for h in headers if h["name"].lower() == "reply-to"),
+            None
+        )
+        recipient = reply_to if reply_to else original_from
+
         message_id = next(
             (h["value"] for h in headers if h["name"].lower() == "message-id"),
             ""
@@ -1059,10 +1083,13 @@ def cmd_draft_reply(args):
 
         # Create message
         message = MIMEText(args.body, "plain")
-        message["to"] = original_from
+        message["to"] = recipient
         message["subject"] = reply_subject
         message["In-Reply-To"] = message_id
         message["References"] = f"{references} {message_id}".strip()
+
+        if args.cc:
+            message["cc"] = args.cc
 
         # Encode and create draft
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
@@ -1082,7 +1109,7 @@ def cmd_draft_reply(args):
             "draft_id": result.get("id"),
             "message_id": result.get("message", {}).get("id"),
             "thread_id": original.get("threadId"),
-            "to": original_from,
+            "to": recipient,
             "subject": reply_subject,
             "account": client.account_email
         }, indent=2))
@@ -1354,6 +1381,7 @@ def main():
     p_reply = subparsers.add_parser("reply", help="Reply to an email")
     p_reply.add_argument("id", help="Original email ID to reply to")
     p_reply.add_argument("--body", required=True, help="Reply body")
+    p_reply.add_argument("--cc", help="CC recipients (comma-separated)")
     p_reply.set_defaults(func=cmd_reply)
 
     # drafts - manage drafts
@@ -1379,6 +1407,7 @@ def main():
     p_drafts_reply = drafts_sub.add_parser("reply", help="Create a draft reply to an email")
     p_drafts_reply.add_argument("id", help="Original email ID to reply to")
     p_drafts_reply.add_argument("--body", required=True, help="Reply body")
+    p_drafts_reply.add_argument("--cc", help="CC recipients (comma-separated)")
     p_drafts_reply.set_defaults(func=cmd_draft_reply)
 
     # drafts delete

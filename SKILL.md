@@ -90,7 +90,7 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 #   -a work list -q "is:unread"          # List unread from work account
 #   -a personal list -q "from:amazon"    # List Amazon emails from personal
 
-# Read full email content
+# Read full email content (shows Reply-To header if present)
 uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] read <msg_id>
 
 # Trash emails
@@ -136,11 +136,12 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 #   send --to "user@example.com" --subject "Report" --body "See attached" --attachment ./report.pdf
 #   send --to "user@example.com" --subject "Files" --body "Multiple files" --attachment ./a.pdf --attachment ./b.pdf
 
-# Reply to an email
-uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg_id> --body BODY
+# Reply to an email (uses Reply-To header if present, otherwise From)
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] reply <msg_id> --body BODY [--cc CC]
 
-# Example:
+# Examples:
 #   reply abc123 --body "Thanks for your message!"
+#   reply abc123 --body "See below" --cc "team@example.com"
 ```
 
 ### Drafts
@@ -152,8 +153,8 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 # Create a new draft
 uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts create --to RECIPIENT --subject SUBJECT --body BODY [--cc CC] [--bcc BCC] [--attachment FILE]
 
-# Create a draft reply to an existing email
-uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts reply <msg_id> --body BODY
+# Create a draft reply to an existing email (uses Reply-To header if present)
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts reply <msg_id> --body BODY [--cc CC]
 
 # Delete a draft
 uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] drafts delete <draft_id>
@@ -203,6 +204,12 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 
 - **Read rules**: Use `Read` tool on `.claude/skills/email-copilot/rules.md`
 - **Update rules**: Use `Edit` tool on `.claude/skills/email-copilot/rules.md`
+
+**Gmail Filters vs rules.md**:
+- **Gmail Filters**: Server-side automatic rules (archive, mark-read, trash). Use for recurring patterns that should always be handled the same way.
+- **rules.md**: Manual rules that the assistant applies during inbox processing. Use for context-dependent decisions that filters can't handle.
+
+Do NOT duplicate filter rules in rules.md. They work together, not redundantly.
 
 ## Common Tasks
 
@@ -256,7 +263,7 @@ search-download -q "from:anthropic (invoice OR receipt) after:2025/01/01 before:
 
 1. **Check Accounts**: Run `accounts` to see available accounts and their emails.
 
-2. **Load Context**: Read `rules.md` to understand user preferences.
+2. **Load Context (MANDATORY)**: **MUST** read `rules.md` before processing ANY emails. Use the Read tool on `.claude/skills/email-copilot/rules.md` to load user preferences, auto-trash list, and classification rules. Skipping this step will result in incorrect email handling.
 
 3. **Process Each Account**: For each configured account:
    - Run `list` with `-a <account>` to fetch emails
@@ -287,6 +294,7 @@ Always ask user before updating `rules.md`.
 
 - **Account Context**: Always check `account` field in output before operations
 - **Cross-Account**: Don't mix email IDs between accounts - IDs are account-specific
+- **Reply-To**: The `reply` command automatically uses `Reply-To` header when present (e.g., mailing lists), falling back to `From` header
 - **GitHub Bot vs Human**: Check snippet for "approved", "lgtm", or bot names
 - **Safety**: If unsure about "Run failed" emails, list in report instead of trashing
 - **Attachments**: Use `search-download` for bulk operations, `download` for single emails
