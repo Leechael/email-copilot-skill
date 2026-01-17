@@ -100,7 +100,12 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] untrash '<json_id_list>'
 
 # Move emails to label (with optional mark-as-read)
-uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] move <label> '<json_id_list>' [-r]
+# NOTE: Label must exist. Use 'labels list' to verify, or add -c to create if missing.
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] move <label> '<json_id_list>' [-r] [-c]
+
+# Examples:
+#   move "Finance/Receipts" '["id1","id2"]' -r     # Move and mark read (label must exist)
+#   move "New Label" '["id1"]' -r -c               # Create label if needed
 ```
 
 ### Attachments
@@ -167,6 +172,27 @@ uv run --project .claude/skills/email-copilot python .claude/skills/email-copilo
 1. Use `drafts reply` or `drafts create` to save to Gmail
 2. User can review/edit in Gmail web interface
 3. Use `drafts send` when ready, or user sends manually
+
+### Gmail Labels
+
+Manage Gmail labels (create, list, rename, delete). Use label names, not internal IDs.
+
+```bash
+# List all labels (shows ID, name, type; may include message counts when available)
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] labels list
+
+# Create a new label
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] labels create "My Label"
+
+# Delete a label (by name or ID)
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] labels delete "My Label"
+
+# Rename a label (by name; case-insensitive match)
+uv run --project .claude/skills/email-copilot python .claude/skills/email-copilot/scripts/email_cli.py [-a ACCOUNT] labels rename "Old Name" "New Name"
+```
+
+**Important:** Always use human-readable label names (e.g., "Cal.com Form"), not internal IDs (e.g., "Label_6").
+**Note:** System labels cannot be deleted or renamed.
 
 ### Gmail Filters
 
@@ -294,6 +320,7 @@ Always ask user before updating `rules.md`.
 
 - **Account Context**: Always check `account` field in output before operations
 - **Cross-Account**: Don't mix email IDs between accounts - IDs are account-specific
+- **Labels**: Always use human-readable label names (e.g., "Cal.com Form"), never internal IDs (e.g., "Label_6"). Use `labels list` to verify label names before moving emails.
 - **Reply-To**: The `reply` command automatically uses `Reply-To` header when present (e.g., mailing lists), falling back to `From` header
 - **GitHub Bot vs Human**: Check snippet for "approved", "lgtm", or bot names
 - **Safety**: If unsure about "Run failed" emails, list in report instead of trashing

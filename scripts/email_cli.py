@@ -282,9 +282,14 @@ def cmd_move(args):
         print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
         return
 
-    label_id = ensure_label(client, args.label)
+    # Find label (only create if --create flag is set)
+    label_id = ensure_label(client, args.label, create=getattr(args, 'create', False))
     if not label_id:
-        print(json.dumps({"status": "error", "message": "Could not ensure label", "account": client.account_email}))
+        print(json.dumps({
+            "status": "error",
+            "message": f"Label not found: '{args.label}'. Use --create to create it, or check existing labels with 'labels list'.",
+            "account": client.account_email
+        }))
         return
 
     # Build modification body
@@ -446,6 +451,174 @@ def cmd_cleanup(args):
             batch = client.service.new_batch_http_request()
 
     print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+
+
+# =============================================================================
+# Label Management
+# =============================================================================
+
+def _list_labels(client):
+    """Fetch labels from Gmail. Returns a list of label dicts (id, name, type, ...)."""
+    results = client.service.users().labels().list(userId="me").execute()
+    return results.get("labels", [])
+
+
+def _resolve_label_by_name_or_id(client, name_or_id):
+    """
+    Resolve a label by ID or (case-insensitive) name.
+    Returns (label_id, label_name, label_type) or (None, None, None).
+    """
+    labels = _list_labels(client)
+
+    for label in labels:
+        if label.get("id") == name_or_id:
+            return label.get("id"), label.get("name"), label.get("type")
+
+    needle = (name_or_id or "").lower()
+    for label in labels:
+        name = label.get("name") or ""
+        if name.lower() == needle:
+            return label.get("id"), label.get("name"), label.get("type")
+
+    return None, None, None
+
+
+def cmd_labels_list(args):
+    """List all Gmail labels."""
+    client = get_client(args.account)
+
+    try:
+        labels = _list_labels(client)
+
+        output = []
+        for label in labels:
+            label_info = {
+                "id": label.get("id"),
+                "name": label.get("name"),
+                "type": label.get("type"),
+            }
+            # Include message counts if available
+            if "messagesTotal" in label:
+                label_info["messages_total"] = label.get("messagesTotal")
+                label_info["messages_unread"] = label.get("messagesUnread")
+            output.append(label_info)
+
+        # Sort: system labels first, then user labels alphabetically
+        system_labels = [l for l in output if l["type"] == "system"]
+        user_labels = sorted([l for l in output if l["type"] == "user"], key=lambda x: x["name"].lower())
+
+        print(json.dumps({
+            "status": "success",
+            "labels": system_labels + user_labels,
+            "count": len(output),
+            "user_labels": len(user_labels),
+            "account": client.account_email
+        }, indent=2))
+
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+
+
+def cmd_labels_create(args):
+    """Create a new Gmail label."""
+    client = get_client(args.account)
+
+    try:
+        label_object = {
+            "name": args.name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        }
+        result = client.service.users().labels().create(
+            userId="me", body=label_object
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "label_id": result.get("id"),
+            "name": result.get("name"),
+            "account": client.account_email
+        }))
+
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+
+
+def cmd_labels_delete(args):
+    """Delete a Gmail label by name or ID."""
+    client = get_client(args.account)
+
+    try:
+        label_id, label_name, label_type = _resolve_label_by_name_or_id(client, args.name_or_id)
+        if not label_id:
+            print(json.dumps({
+                "status": "error",
+                "message": f"Label not found: {args.name_or_id}",
+                "account": client.account_email
+            }))
+            return
+
+        # Prevent deleting system labels
+        if label_type == "system":
+            print(json.dumps({
+                "status": "error",
+                "message": f"Cannot delete system label: {label_name}",
+                "account": client.account_email
+            }))
+            return
+
+        client.service.users().labels().delete(userId="me", id=label_id).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "deleted_label_id": label_id,
+            "deleted_label_name": label_name,
+            "account": client.account_email
+        }))
+
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+
+
+def cmd_labels_rename(args):
+    """Rename a Gmail label."""
+    client = get_client(args.account)
+
+    try:
+        label_id, old_name, label_type = _resolve_label_by_name_or_id(client, args.old_name)
+        if not label_id:
+            print(json.dumps({
+                "status": "error",
+                "message": f"Label not found: {args.old_name}",
+                "account": client.account_email
+            }))
+            return
+
+        if label_type == "system":
+            print(json.dumps({
+                "status": "error",
+                "message": f"Cannot rename system label: {old_name}",
+                "account": client.account_email
+            }))
+            return
+
+        # Update the label
+        result = client.service.users().labels().patch(
+            userId="me",
+            id=label_id,
+            body={"name": args.new_name}
+        ).execute()
+
+        print(json.dumps({
+            "status": "success",
+            "label_id": label_id,
+            "old_name": old_name,
+            "new_name": result.get("name"),
+            "account": client.account_email
+        }))
+
+    except Exception as e:
+        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
 
 
 # =============================================================================
@@ -1235,16 +1408,33 @@ def parse_ids(ids_input):
     return ids_input.split(",")
 
 
-def ensure_label(client, label_name):
-    """Ensures a label exists, creating it if necessary."""
+def find_label(client, label_name):
+    """Find a label by name (case-insensitive). Returns (label_id, label_name) or (None, None)."""
     try:
         results = client.service.users().labels().list(userId="me").execute()
         labels = results.get("labels", [])
 
         for label in labels:
             if label["name"].lower() == label_name.lower():
-                return label["id"]
+                return label["id"], label["name"]
 
+        return None, None
+    except Exception as e:
+        print(json.dumps({"error": f"Failed to find label: {str(e)}"}), file=sys.stderr)
+        return None, None
+
+
+def ensure_label(client, label_name, create=False):
+    """Find a label by name. If create=True, creates it if not found."""
+    label_id, _ = find_label(client, label_name)
+
+    if label_id:
+        return label_id
+
+    if not create:
+        return None
+
+    try:
         label_object = {
             "name": label_name,
             "labelListVisibility": "labelShow",
@@ -1258,7 +1448,7 @@ def ensure_label(client, label_name):
         )
         return created_label["id"]
     except Exception as e:
-        print(json.dumps({"error": f"Failed to ensure label: {str(e)}"}), file=sys.stderr)
+        print(json.dumps({"error": f"Failed to create label: {str(e)}"}), file=sys.stderr)
         return None
 
 
@@ -1304,9 +1494,10 @@ def main():
 
     # move
     p_move = subparsers.add_parser("move", help="Move emails to a label")
-    p_move.add_argument("label", help="Target label name")
+    p_move.add_argument("label", help="Target label name (must exist, use 'labels list' to check)")
     p_move.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
     p_move.add_argument("-r", "--read", action="store_true", help="Also mark as read")
+    p_move.add_argument("-c", "--create", action="store_true", help="Create label if it doesn't exist")
     p_move.set_defaults(func=cmd_move)
 
     # summary
@@ -1320,6 +1511,26 @@ def main():
     p_cleanup.add_argument("label", help="Label name")
     p_cleanup.add_argument("-d", "--days", type=int, default=30, help="Days threshold")
     p_cleanup.set_defaults(func=cmd_cleanup)
+
+    # labels
+    p_labels = subparsers.add_parser("labels", help="Manage Gmail labels")
+    labels_sub = p_labels.add_subparsers(dest="labels_cmd")
+
+    p_labels_list = labels_sub.add_parser("list", help="List all labels")
+    p_labels_list.set_defaults(func=cmd_labels_list)
+
+    p_labels_create = labels_sub.add_parser("create", help="Create a new label")
+    p_labels_create.add_argument("name", help="Label name")
+    p_labels_create.set_defaults(func=cmd_labels_create)
+
+    p_labels_delete = labels_sub.add_parser("delete", help="Delete a label")
+    p_labels_delete.add_argument("name_or_id", help="Label name or ID")
+    p_labels_delete.set_defaults(func=cmd_labels_delete)
+
+    p_labels_rename = labels_sub.add_parser("rename", help="Rename a label")
+    p_labels_rename.add_argument("old_name", help="Current label name")
+    p_labels_rename.add_argument("new_name", help="New label name")
+    p_labels_rename.set_defaults(func=cmd_labels_rename)
 
     # filters
     p_filters = subparsers.add_parser("filters", help="Manage Gmail filters")
@@ -1424,6 +1635,10 @@ def main():
 
     if not args.command:
         parser.print_help()
+        sys.exit(1)
+
+    if args.command == "labels" and not args.labels_cmd:
+        p_labels.print_help()
         sys.exit(1)
 
     if args.command == "filters" and not args.filters_cmd:
