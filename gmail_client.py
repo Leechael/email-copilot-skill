@@ -252,12 +252,12 @@ class GmailClient:
                     if part["mimeType"] == "text/plain":
                         data = part["body"].get("data")
                         if data:
-                            body = base64.urlsafe_b64decode(data).decode()
+                            body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
                             break
             elif "body" in payload:
                 data = payload["body"].get("data")
                 if data:
-                    body = base64.urlsafe_b64decode(data).decode()
+                    body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
 
             return {
                 "id": msg_id,
@@ -279,13 +279,29 @@ def get_available_accounts() -> Dict[str, Dict]:
         with open(CONFIG_PATH, "rb") as f:
             config = tomllib.load(f)
         return config.get("accounts", {})
-    except Exception:
+    except Exception as e:
+        logging.debug(f"Could not load accounts: {e}")
         return {}
 
 
 def ensure_account(name: str) -> bool:
-    """Ensure account exists in config.toml, add if not present."""
+    """Ensure account exists in config.toml, add if not present. Creates config.toml if missing."""
     try:
+        # Create config.toml with defaults if it doesn't exist
+        if not os.path.exists(CONFIG_PATH):
+            doc = tomlkit.document()
+            doc.add("gmail", {
+                "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+                "default_account": name,
+            })
+            doc.add("accounts", {
+                name: {"token_path": f"tokens/{name}.json"}
+            })
+            with open(CONFIG_PATH, "w") as f:
+                tomlkit.dump(doc, f)
+            print(f"Created config.toml with account '{name}'.")
+            return True
+
         with open(CONFIG_PATH, "r") as f:
             doc = tomlkit.load(f)
 
@@ -306,7 +322,7 @@ def ensure_account(name: str) -> bool:
         print(f"Account '{name}' added to config.")
         return True
     except Exception as e:
-        print(f"Error ensuring account: {e}")
+        print(f"Error ensuring account: {e}", file=sys.stderr)
         return False
 
 
@@ -365,7 +381,8 @@ def list_accounts():
         with open(CONFIG_PATH, "rb") as f:
             config = tomllib.load(f)
         default = config.get("gmail", {}).get("default_account", "default")
-    except:
+    except Exception as e:
+        logging.debug(f"Could not read default account: {e}")
         default = "default"
 
     print("Configured accounts:")
@@ -398,8 +415,8 @@ def check_setup() -> dict:
                     "email": info.get("email"),
                     "authenticated": os.path.exists(token_path),
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Error checking setup: {e}")
 
     # Ready if we have credentials and at least one authenticated account
     status["ready"] = (

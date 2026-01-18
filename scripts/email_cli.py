@@ -50,7 +50,8 @@ def cmd_accounts(args):
         with open(CONFIG_PATH, "rb") as f:
             config = tomllib.load(f)
         default = config.get("gmail", {}).get("default_account", "default")
-    except:
+    except Exception as e:
+        print(f"Warning: Could not read config: {e}", file=sys.stderr)
         default = "default"
 
     output = []
@@ -101,7 +102,7 @@ def cmd_list(args):
             if not page_token:
                 break
         except Exception as e:
-            print(f"<error>{str(e)}</error>")
+            print(f"<error account='{client.account_email}'>{str(e)}</error>")
             return
 
     if not all_msgs:
@@ -180,16 +181,9 @@ def cmd_read(args):
 
         payload = msg.get("payload", {})
         headers = payload.get("headers", [])
-        subject = next(
-            (h["value"] for h in headers if h["name"].lower() == "subject"),
-            "No Subject",
-        )
-        sender = next(
-            (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
-        )
-        reply_to = next(
-            (h["value"] for h in headers if h["name"].lower() == "reply-to"), None
-        )
+        subject = get_header(headers, "subject", "No Subject")
+        sender = get_header(headers, "from", "Unknown")
+        reply_to = get_header(headers, "reply-to") or None
 
         body = ""
         if "parts" in payload:
@@ -197,12 +191,12 @@ def cmd_read(args):
                 if part["mimeType"] == "text/plain":
                     data = part["body"].get("data", "")
                     if data:
-                        body = base64.urlsafe_b64decode(data).decode("utf-8")
+                        body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
                         break
         elif "body" in payload:
             data = payload["body"].get("data", "")
             if data:
-                body = base64.urlsafe_b64decode(data).decode("utf-8")
+                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
 
         if not body:
             body = msg.get("snippet", "")
@@ -215,63 +209,23 @@ def cmd_read(args):
         print(f"{'-' * 40}\n{body}")
 
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_trash(args):
     """Move emails to trash."""
     client = get_client(args.account)
     ids = parse_ids(args.ids)
-    if not ids:
-        print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
-        return
-
-    batch = client.service.new_batch_http_request()
-    count = 0
-    total = len(ids)
-
-    for mid in ids:
-        batch.add(client.service.users().messages().trash(userId="me", id=mid))
-        count += 1
-
-        if count % 50 == 0 or count == total:
-            try:
-                batch.execute()
-                time.sleep(0.5)
-                batch = client.service.new_batch_http_request()
-            except Exception as e:
-                print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
-                return
-
-    print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+    result = batch_message_operation(client, ids, "trash")
+    print(json.dumps(result))
 
 
 def cmd_untrash(args):
     """Restore emails from trash."""
     client = get_client(args.account)
     ids = parse_ids(args.ids)
-    if not ids:
-        print(json.dumps({"status": "skipped", "count": 0, "account": client.account_email}))
-        return
-
-    batch = client.service.new_batch_http_request()
-    count = 0
-    total = len(ids)
-
-    for mid in ids:
-        batch.add(client.service.users().messages().untrash(userId="me", id=mid))
-        count += 1
-
-        if count % 50 == 0 or count == total:
-            try:
-                batch.execute()
-                time.sleep(0.5)
-                batch = client.service.new_batch_http_request()
-            except Exception as e:
-                print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
-                return
-
-    print(json.dumps({"status": "success", "count": total, "account": client.account_email}))
+    result = batch_message_operation(client, ids, "untrash")
+    print(json.dumps(result))
 
 
 def cmd_move(args):
@@ -283,13 +237,12 @@ def cmd_move(args):
         return
 
     # Find label (only create if --create flag is set)
-    label_id = ensure_label(client, args.label, create=getattr(args, 'create', False))
+    label_id = ensure_label(client, args.label, create=args.create)
     if not label_id:
-        print(json.dumps({
-            "status": "error",
-            "message": f"Label not found: '{args.label}'. Use --create to create it, or check existing labels with 'labels list'.",
-            "account": client.account_email
-        }))
+        output_error(
+            f"Label not found: '{args.label}'. Use --create to create it, or check existing labels with 'labels list'.",
+            client.account_email
+        )
         return
 
     # Build modification body
@@ -303,12 +256,12 @@ def cmd_move(args):
 
     try:
         client.service.users().messages().batchModify(userId="me", body=body).execute()
-        result = {"status": "success", "count": len(ids), "label": args.label, "account": client.account_email}
+        data = {"count": len(ids), "label": args.label}
         if args.read:
-            result["marked_read"] = True
-        print(json.dumps(result))
+            data["marked_read"] = True
+        output_success(data, client.account_email)
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
@@ -319,19 +272,10 @@ def cmd_summary(args):
     """Get email content from a label for summarization."""
     client = get_client(args.account)
 
-    # Find label ID
-    results = client.service.users().labels().list(userId="me").execute()
-    label_id = next(
-        (
-            l["id"]
-            for l in results.get("labels", [])
-            if l["name"].lower() == args.label.lower()
-        ),
-        None,
-    )
-
+    # Find label ID using unified lookup
+    label_id, _, _ = resolve_label(client, args.label)
     if not label_id:
-        print(json.dumps({"error": f"Label '{args.label}' not found", "account": client.account_email}))
+        output_error(f"Label '{args.label}' not found", client.account_email)
         return
 
     resp = (
@@ -369,14 +313,9 @@ def cmd_summary(args):
         payload = data.get("payload", {})
         headers = payload.get("headers", [])
 
-        subject = next(
-            (h["value"] for h in headers if h["name"].lower() == "subject"),
-            "No Subject",
-        )
-        sender = next(
-            (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
-        )
-        date = next((h["value"] for h in headers if h["name"].lower() == "date"), "")
+        subject = get_header(headers, "subject", "No Subject")
+        sender = get_header(headers, "from", "Unknown")
+        date = get_header(headers, "date")
 
         body = ""
         if "parts" in payload:
@@ -384,12 +323,12 @@ def cmd_summary(args):
                 if part["mimeType"] == "text/plain":
                     data_enc = part["body"].get("data", "")
                     if data_enc:
-                        body = base64.urlsafe_b64decode(data_enc).decode("utf-8")
+                        body = base64.urlsafe_b64decode(data_enc).decode("utf-8", errors="replace")
                         break
         elif "body" in payload:
             data_enc = payload["body"].get("data", "")
             if data_enc:
-                body = base64.urlsafe_b64decode(data_enc).decode("utf-8")
+                body = base64.urlsafe_b64decode(data_enc).decode("utf-8", errors="replace")
 
         if not body:
             body = data.get("snippet", "")
@@ -411,7 +350,9 @@ def cmd_cleanup(args):
 
     cutoff_date = datetime.now() - timedelta(days=args.days)
     date_query = cutoff_date.strftime("%Y/%m/%d")
-    query = f"label:{args.label} before:{date_query}"
+    # Quote label name if it contains spaces or special characters
+    label_query = f'"{args.label}"' if " " in args.label else args.label
+    query = f"label:{label_query} before:{date_query}"
 
     print(f"[{client.account_email}] Searching for emails in '{args.label}' before {date_query}...", file=sys.stderr)
 
@@ -463,26 +404,6 @@ def _list_labels(client):
     return results.get("labels", [])
 
 
-def _resolve_label_by_name_or_id(client, name_or_id):
-    """
-    Resolve a label by ID or (case-insensitive) name.
-    Returns (label_id, label_name, label_type) or (None, None, None).
-    """
-    labels = _list_labels(client)
-
-    for label in labels:
-        if label.get("id") == name_or_id:
-            return label.get("id"), label.get("name"), label.get("type")
-
-    needle = (name_or_id or "").lower()
-    for label in labels:
-        name = label.get("name") or ""
-        if name.lower() == needle:
-            return label.get("id"), label.get("name"), label.get("type")
-
-    return None, None, None
-
-
 def cmd_labels_list(args):
     """List all Gmail labels."""
     client = get_client(args.account)
@@ -516,7 +437,7 @@ def cmd_labels_list(args):
         }, indent=2))
 
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_labels_create(args):
@@ -533,15 +454,13 @@ def cmd_labels_create(args):
             userId="me", body=label_object
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "label_id": result.get("id"),
-            "name": result.get("name"),
-            "account": client.account_email
-        }))
+            "name": result.get("name")
+        }, client.account_email)
 
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_labels_delete(args):
@@ -549,35 +468,25 @@ def cmd_labels_delete(args):
     client = get_client(args.account)
 
     try:
-        label_id, label_name, label_type = _resolve_label_by_name_or_id(client, args.name_or_id)
+        label_id, label_name, label_type = resolve_label(client, args.name_or_id)
         if not label_id:
-            print(json.dumps({
-                "status": "error",
-                "message": f"Label not found: {args.name_or_id}",
-                "account": client.account_email
-            }))
+            output_error(f"Label not found: {args.name_or_id}", client.account_email)
             return
 
         # Prevent deleting system labels
         if label_type == "system":
-            print(json.dumps({
-                "status": "error",
-                "message": f"Cannot delete system label: {label_name}",
-                "account": client.account_email
-            }))
+            output_error(f"Cannot delete system label: {label_name}", client.account_email)
             return
 
         client.service.users().labels().delete(userId="me", id=label_id).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "deleted_label_id": label_id,
-            "deleted_label_name": label_name,
-            "account": client.account_email
-        }))
+            "deleted_label_name": label_name
+        }, client.account_email)
 
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_labels_rename(args):
@@ -585,21 +494,13 @@ def cmd_labels_rename(args):
     client = get_client(args.account)
 
     try:
-        label_id, old_name, label_type = _resolve_label_by_name_or_id(client, args.old_name)
+        label_id, old_name, label_type = resolve_label(client, args.old_name)
         if not label_id:
-            print(json.dumps({
-                "status": "error",
-                "message": f"Label not found: {args.old_name}",
-                "account": client.account_email
-            }))
+            output_error(f"Label not found: {args.old_name}", client.account_email)
             return
 
         if label_type == "system":
-            print(json.dumps({
-                "status": "error",
-                "message": f"Cannot rename system label: {old_name}",
-                "account": client.account_email
-            }))
+            output_error(f"Cannot rename system label: {old_name}", client.account_email)
             return
 
         # Update the label
@@ -609,16 +510,14 @@ def cmd_labels_rename(args):
             body={"name": args.new_name}
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "label_id": label_id,
             "old_name": old_name,
-            "new_name": result.get("name"),
-            "account": client.account_email
-        }))
+            "new_name": result.get("name")
+        }, client.account_email)
 
     except Exception as e:
-        print(json.dumps({"status": "error", "message": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
@@ -664,7 +563,7 @@ def cmd_filters_list(args):
 
         print(json.dumps({"filters": output, "count": len(output), "account": client.account_email}, indent=2))
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_filters_add(args):
@@ -685,15 +584,17 @@ def cmd_filters_add(args):
         criteria["hasAttachment"] = True
 
     if not criteria:
-        print(json.dumps({"error": "At least one criteria required", "account": client.account_email}))
+        output_error("At least one criteria required", client.account_email)
         return
 
     # Build action
     action = {}
     if args.add_label:
-        label_id = ensure_label(client, args.add_label)
-        if label_id:
-            action["addLabelIds"] = [label_id]
+        label_id = ensure_label(client, args.add_label, create=True)
+        if not label_id:
+            output_error(f"Could not find or create label: {args.add_label}", client.account_email)
+            return
+        action["addLabelIds"] = [label_id]
     if args.archive:
         action["removeLabelIds"] = action.get("removeLabelIds", []) + ["INBOX"]
     if args.mark_read:
@@ -706,7 +607,7 @@ def cmd_filters_add(args):
         action["forward"] = args.forward
 
     if not action:
-        print(json.dumps({"error": "At least one action required", "account": client.account_email}))
+        output_error("At least one action required", client.account_email)
         return
 
     filter_body = {"criteria": criteria, "action": action}
@@ -715,9 +616,9 @@ def cmd_filters_add(args):
         result = client.service.users().settings().filters().create(
             userId="me", body=filter_body
         ).execute()
-        print(json.dumps({"status": "success", "filter_id": result.get("id"), "account": client.account_email}))
+        output_success({"filter_id": result.get("id")}, client.account_email)
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_filters_delete(args):
@@ -728,9 +629,9 @@ def cmd_filters_delete(args):
         client.service.users().settings().filters().delete(
             userId="me", id=args.id
         ).execute()
-        print(json.dumps({"status": "success", "deleted_id": args.id, "account": client.account_email}))
+        output_success({"deleted_id": args.id}, client.account_email)
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
@@ -765,15 +666,14 @@ def cmd_attachments(args):
         if "parts" in payload:
             find_attachments(payload["parts"])
 
-        print(json.dumps({
+        output_success({
             "message_id": args.id,
             "attachments": attachments,
-            "count": len(attachments),
-            "account": client.account_email
-        }, indent=2))
+            "count": len(attachments)
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_download(args):
@@ -847,17 +747,15 @@ def cmd_download(args):
         if "parts" in payload:
             download_parts(payload["parts"])
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "message_id": args.id,
             "downloaded": downloaded,
             "count": len([d for d in downloaded if "saved_as" in d]),
-            "output_dir": output_dir,
-            "account": client.account_email
-        }, indent=2))
+            "output_dir": output_dir
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_search_download(args):
@@ -907,8 +805,8 @@ def cmd_search_download(args):
                 year_match = re.search(r'\b(20\d{2})\b', date)
                 if year_match:
                     year = int(year_match.group(1))
-            except:
-                pass
+            except Exception:
+                pass  # Year parsing is optional, continue without it
 
             def download_parts(parts):
                 downloaded = []
@@ -971,20 +869,18 @@ def cmd_search_download(args):
                         "attachments": [d["filename"] for d in downloaded if "filename" in d]
                     })
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "query": args.query,
             "emails_searched": len(messages),
             "emails_with_attachments": len(emails_with_attachments),
             "total_downloaded": len([d for d in all_downloaded if "saved_as" in d]),
             "output_dir": output_dir,
             "downloaded_files": all_downloaded,
-            "emails": emails_with_attachments,
-            "account": client.account_email
-        }, indent=2))
+            "emails": emails_with_attachments
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
@@ -1023,10 +919,7 @@ def cmd_send(args):
                     )
                     message.attach(attachment)
                 else:
-                    print(json.dumps({
-                        "error": f"Attachment not found: {filepath}",
-                        "account": client.account_email
-                    }))
+                    output_error(f"Attachment not found: {filepath}", client.account_email)
                     return
         else:
             message = MIMEText(args.body, "plain")
@@ -1042,24 +935,22 @@ def cmd_send(args):
             message["reply-to"] = args.reply_to
 
         # Encode and send
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8", errors="replace")
 
         result = client.service.users().messages().send(
             userId="me",
             body={"raw": raw}
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "message_id": result.get("id"),
             "thread_id": result.get("threadId"),
             "to": args.to,
-            "subject": args.subject,
-            "account": client.account_email
-        }, indent=2))
+            "subject": args.subject
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_reply(args):
@@ -1075,30 +966,13 @@ def cmd_reply(args):
         payload = original.get("payload", {})
         headers = payload.get("headers", [])
 
-        # Extract headers
-        original_subject = next(
-            (h["value"] for h in headers if h["name"].lower() == "subject"),
-            ""
-        )
-        original_from = next(
-            (h["value"] for h in headers if h["name"].lower() == "from"),
-            ""
-        )
-        # Check Reply-To header first, fall back to From
-        reply_to = next(
-            (h["value"] for h in headers if h["name"].lower() == "reply-to"),
-            None
-        )
+        # Extract headers using helper
+        original_subject = get_header(headers, "subject")
+        original_from = get_header(headers, "from")
+        reply_to = get_header(headers, "reply-to") or None
         recipient = reply_to if reply_to else original_from
-
-        message_id = next(
-            (h["value"] for h in headers if h["name"].lower() == "message-id"),
-            ""
-        )
-        references = next(
-            (h["value"] for h in headers if h["name"].lower() == "references"),
-            ""
-        )
+        message_id = get_header(headers, "message-id")
+        references = get_header(headers, "references")
 
         # Build reply subject
         reply_subject = original_subject
@@ -1116,7 +990,7 @@ def cmd_reply(args):
             message["cc"] = args.cc
 
         # Encode and send
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8", errors="replace")
 
         result = client.service.users().messages().send(
             userId="me",
@@ -1126,17 +1000,15 @@ def cmd_reply(args):
             }
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "message_id": result.get("id"),
             "thread_id": result.get("threadId"),
             "to": recipient,
-            "subject": reply_subject,
-            "account": client.account_email
-        }, indent=2))
+            "subject": reply_subject
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
@@ -1174,10 +1046,7 @@ def cmd_draft(args):
                     )
                     message.attach(attachment)
                 else:
-                    print(json.dumps({
-                        "error": f"Attachment not found: {filepath}",
-                        "account": client.account_email
-                    }))
+                    output_error(f"Attachment not found: {filepath}", client.account_email)
                     return
         else:
             message = MIMEText(args.body, "plain")
@@ -1191,24 +1060,22 @@ def cmd_draft(args):
             message["bcc"] = args.bcc
 
         # Encode and create draft
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8", errors="replace")
 
         result = client.service.users().drafts().create(
             userId="me",
             body={"message": {"raw": raw}}
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "draft_id": result.get("id"),
             "message_id": result.get("message", {}).get("id"),
             "to": args.to,
-            "subject": args.subject,
-            "account": client.account_email
-        }, indent=2))
+            "subject": args.subject
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_draft_reply(args):
@@ -1224,30 +1091,13 @@ def cmd_draft_reply(args):
         payload = original.get("payload", {})
         headers = payload.get("headers", [])
 
-        # Extract headers
-        original_subject = next(
-            (h["value"] for h in headers if h["name"].lower() == "subject"),
-            ""
-        )
-        original_from = next(
-            (h["value"] for h in headers if h["name"].lower() == "from"),
-            ""
-        )
-        # Check Reply-To header first, fall back to From
-        reply_to = next(
-            (h["value"] for h in headers if h["name"].lower() == "reply-to"),
-            None
-        )
+        # Extract headers using helper
+        original_subject = get_header(headers, "subject")
+        original_from = get_header(headers, "from")
+        reply_to = get_header(headers, "reply-to") or None
         recipient = reply_to if reply_to else original_from
-
-        message_id = next(
-            (h["value"] for h in headers if h["name"].lower() == "message-id"),
-            ""
-        )
-        references = next(
-            (h["value"] for h in headers if h["name"].lower() == "references"),
-            ""
-        )
+        message_id = get_header(headers, "message-id")
+        references = get_header(headers, "references")
 
         # Build reply subject
         reply_subject = original_subject
@@ -1265,7 +1115,7 @@ def cmd_draft_reply(args):
             message["cc"] = args.cc
 
         # Encode and create draft
-        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8", errors="replace")
 
         result = client.service.users().drafts().create(
             userId="me",
@@ -1277,18 +1127,16 @@ def cmd_draft_reply(args):
             }
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "draft_id": result.get("id"),
             "message_id": result.get("message", {}).get("id"),
             "thread_id": original.get("threadId"),
             "to": recipient,
-            "subject": reply_subject,
-            "account": client.account_email
-        }, indent=2))
+            "subject": reply_subject
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_drafts_list(args):
@@ -1320,27 +1168,15 @@ def cmd_drafts_list(args):
                 ).execute()
 
                 headers = full_msg.get("payload", {}).get("headers", [])
-                subject = next(
-                    (h["value"] for h in headers if h["name"].lower() == "subject"),
-                    "No Subject"
-                )
-                to = next(
-                    (h["value"] for h in headers if h["name"].lower() == "to"),
-                    ""
-                )
-                date = next(
-                    (h["value"] for h in headers if h["name"].lower() == "date"),
-                    ""
-                )
-
                 output.append({
                     "draft_id": draft_id,
                     "message_id": msg_id,
-                    "subject": subject,
-                    "to": to,
-                    "date": date
+                    "subject": get_header(headers, "subject", "No Subject"),
+                    "to": get_header(headers, "to"),
+                    "date": get_header(headers, "date")
                 })
-            except:
+            except Exception:
+                # Could not fetch full message details, return basic info
                 output.append({
                     "draft_id": draft_id,
                     "message_id": msg_id
@@ -1353,7 +1189,7 @@ def cmd_drafts_list(args):
         }, indent=2))
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_draft_delete(args):
@@ -1365,14 +1201,10 @@ def cmd_draft_delete(args):
             userId="me", id=args.id
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
-            "deleted_draft_id": args.id,
-            "account": client.account_email
-        }))
+        output_success({"deleted_draft_id": args.id}, client.account_email)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 def cmd_draft_send(args):
@@ -1384,49 +1216,122 @@ def cmd_draft_send(args):
             userId="me", body={"id": args.id}
         ).execute()
 
-        print(json.dumps({
-            "status": "success",
+        output_success({
             "message_id": result.get("id"),
-            "thread_id": result.get("threadId"),
-            "account": client.account_email
-        }, indent=2))
+            "thread_id": result.get("threadId")
+        }, client.account_email, indent=2)
 
     except Exception as e:
-        print(json.dumps({"error": str(e), "account": client.account_email}))
+        output_error(str(e), client.account_email)
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
 
+def output_error(message: str, account: str = None) -> None:
+    """Unified error output format."""
+    result = {"status": "error", "message": message}
+    if account:
+        result["account"] = account
+    print(json.dumps(result))
+
+
+def output_success(data: dict, account: str = None, indent: int = None) -> None:
+    """Unified success output format."""
+    # Remove 'status' from data if present to prevent override
+    clean_data = {k: v for k, v in data.items() if k != "status"}
+    result = {"status": "success", **clean_data}
+    if account:
+        result["account"] = account
+    print(json.dumps(result, indent=indent))
+
+
+def get_header(headers: list, name: str, default: str = "") -> str:
+    """Extract a header value from headers list (case-insensitive)."""
+    return next(
+        (h["value"] for h in headers if h["name"].lower() == name.lower()),
+        default
+    )
+
+
 def parse_ids(ids_input):
     """Parse IDs from JSON array or comma-separated string."""
     if not ids_input:
         return []
+
+    ids_input = ids_input.strip()
+
+    # Try JSON array first
     if ids_input.startswith("["):
-        return json.loads(ids_input)
-    return ids_input.split(",")
+        try:
+            parsed = json.loads(ids_input)
+            # Filter empty strings and strip whitespace
+            return [str(id_).strip() for id_ in parsed if str(id_).strip()]
+        except json.JSONDecodeError as e:
+            print(json.dumps({"status": "error", "message": f"Invalid JSON: {e}"}), file=sys.stderr)
+            return []
+
+    # Comma-separated: split, strip, and filter empty
+    return [id_.strip() for id_ in ids_input.split(",") if id_.strip()]
 
 
-def find_label(client, label_name):
-    """Find a label by name (case-insensitive). Returns (label_id, label_name) or (None, None)."""
-    try:
-        results = client.service.users().labels().list(userId="me").execute()
-        labels = results.get("labels", [])
+def batch_message_operation(client, ids: list, operation: str) -> dict:
+    """
+    Execute batch operation on messages.
 
-        for label in labels:
-            if label["name"].lower() == label_name.lower():
-                return label["id"], label["name"]
+    Args:
+        client: Gmail client
+        ids: List of message IDs
+        operation: 'trash' or 'untrash'
 
-        return None, None
-    except Exception as e:
-        print(json.dumps({"error": f"Failed to find label: {str(e)}"}), file=sys.stderr)
-        return None, None
+    Returns:
+        Result dict with status, count, and account
+    """
+    if not ids:
+        return {"status": "skipped", "count": 0, "account": client.account_email}
+
+    batch = client.service.new_batch_http_request()
+    method = getattr(client.service.users().messages(), operation)
+
+    for i, mid in enumerate(ids, 1):
+        batch.add(method(userId="me", id=mid))
+
+        if i % 50 == 0 or i == len(ids):
+            try:
+                batch.execute()
+                time.sleep(0.5)
+                batch = client.service.new_batch_http_request()
+            except Exception as e:
+                return {"status": "error", "message": str(e), "account": client.account_email}
+
+    return {"status": "success", "count": len(ids), "account": client.account_email}
+
+
+def resolve_label(client, name_or_id):
+    """
+    Unified label lookup by ID or name (case-insensitive).
+    Returns: (label_id, label_name, label_type) or (None, None, None)
+    """
+    labels = _list_labels(client)
+
+    # First try exact ID match
+    for label in labels:
+        if label.get("id") == name_or_id:
+            return label.get("id"), label.get("name"), label.get("type")
+
+    # Then try case-insensitive name match
+    needle = (name_or_id or "").lower()
+    for label in labels:
+        if (label.get("name") or "").lower() == needle:
+            return label.get("id"), label.get("name"), label.get("type")
+
+    return None, None, None
 
 
 def ensure_label(client, label_name, create=False):
     """Find a label by name. If create=True, creates it if not found."""
-    label_id, _ = find_label(client, label_name)
+    label_id, _, _ = resolve_label(client, label_name)
 
     if label_id:
         return label_id
@@ -1448,7 +1353,7 @@ def ensure_label(client, label_name, create=False):
         )
         return created_label["id"]
     except Exception as e:
-        print(json.dumps({"error": f"Failed to create label: {str(e)}"}), file=sys.stderr)
+        output_error(f"Failed to create label: {str(e)}", client.account_email)
         return None
 
 
