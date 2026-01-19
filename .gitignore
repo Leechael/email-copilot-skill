@@ -2,6 +2,7 @@
 config.toml
 credentials.json
 rules.md
+action-log.md
 
 # OAuth tokens
 tokens/
