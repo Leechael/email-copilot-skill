@@ -202,6 +202,7 @@ def cmd_read(args):
             body = msg.get("snippet", "")
 
         print(f"Account: {client.account_email} ({client.account_name})")
+        print(f"Labels: {', '.join(msg.get('labelIds', []))}")
         print(f"Subject: {subject}")
         print(f"From: {sender}")
         if reply_to:
@@ -226,6 +227,30 @@ def cmd_untrash(args):
     ids = parse_ids(args.ids)
     result = batch_message_operation(client, ids, "untrash")
     print(json.dumps(result))
+
+
+def cmd_archive(args):
+    """Archive emails (remove INBOX label)."""
+    client = get_client(args.account)
+    ids = parse_ids(args.ids)
+    if not ids:
+        output_success({"count": 0, "status": "skipped"}, client.account_email)
+        return
+
+    remove_labels = ["INBOX"]
+    if args.read:
+        remove_labels.append("UNREAD")
+
+    body = {"ids": ids, "removeLabelIds": remove_labels}
+
+    try:
+        client.service.users().messages().batchModify(userId="me", body=body).execute()
+        data = {"count": len(ids), "action": "archive"}
+        if args.read:
+            data["marked_read"] = True
+        output_success(data, client.account_email)
+    except Exception as e:
+        output_error(str(e), client.account_email)
 
 
 def cmd_move(args):
@@ -1396,6 +1421,12 @@ def main():
     p_untrash = subparsers.add_parser("untrash", help="Restore emails from trash")
     p_untrash.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
     p_untrash.set_defaults(func=cmd_untrash)
+
+    # archive
+    p_archive = subparsers.add_parser("archive", help="Archive emails (remove INBOX label)")
+    p_archive.add_argument("ids", help="Email IDs (JSON array or comma-separated)")
+    p_archive.add_argument("-r", "--read", action="store_true", help="Also mark as read")
+    p_archive.set_defaults(func=cmd_archive)
 
     # move
     p_move = subparsers.add_parser("move", help="Move emails to a label")
