@@ -20,13 +20,13 @@ from datetime import datetime, timedelta
 # Add skill directory to sys.path for local imports
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, SKILL_DIR)
-from gmail_client import GmailClient, get_available_accounts, CONFIG_PATH
+from gmail_client import GmailClient, AuthExpiredError, get_available_accounts, CONFIG_PATH
 
 
 def get_client(account: str = None) -> GmailClient:
-    """Get authenticated Gmail client for specified account."""
+    """Get authenticated Gmail client for specified account (non-interactive)."""
     client = GmailClient(account=account)
-    client.authenticate()
+    client.authenticate(interactive=False)
     return client
 
 
@@ -1590,7 +1590,15 @@ def main():
         args.func(args)
         return
 
-    args.func(args)
+    try:
+        args.func(args)
+    except AuthExpiredError as e:
+        print(json.dumps({
+            "status": "auth_expired",
+            "account": e.account_name,
+            "message": f"Auth expired for account '{e.account_name}'. User must re-authenticate manually.",
+            "command": e.reauth_command,
+        }))
 
 
 if __name__ == "__main__":

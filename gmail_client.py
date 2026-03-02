@@ -51,6 +51,17 @@ DEFAULT_CREDENTIALS_PATH = os.path.join(SKILL_DIR, "credentials.json")
 DEFAULT_TOKENS_DIR = os.path.join(SKILL_DIR, "tokens")
 
 
+class AuthExpiredError(Exception):
+    """Raised when token is expired/invalid and interactive re-auth is required."""
+    def __init__(self, account_name: str, reauth_command: str):
+        self.account_name = account_name
+        self.reauth_command = reauth_command
+        super().__init__(
+            f"Auth expired for account '{account_name}'. "
+            f"Run manually: {reauth_command}"
+        )
+
+
 class GmailClient:
     def __init__(self, account: str = None):
         """
@@ -103,8 +114,13 @@ class GmailClient:
                 }
             }
 
-    def authenticate(self):
-        """Handle OAuth2 authentication"""
+    def authenticate(self, interactive: bool = True):
+        """Handle OAuth2 authentication.
+
+        Args:
+            interactive: If True, launch browser OAuth flow when needed.
+                         If False, raise an error instead (for non-interactive/agent use).
+        """
         # Ensure token directory exists
         token_dir = os.path.dirname(self.token_path)
         if token_dir:
@@ -124,6 +140,12 @@ class GmailClient:
                     self.creds = None
 
             if not self.creds:
+                if not interactive:
+                    raise AuthExpiredError(
+                        self.account_name,
+                        f"cd {SKILL_DIR} && uv run python gmail_client.py --auth {self.account_name}"
+                    )
+
                 if not os.path.exists(self.credentials_path):
                     logging.error(
                         f"Credentials file not found at: {self.credentials_path}"
@@ -392,8 +414,26 @@ def list_accounts():
         print(f"  {name}: {email}{is_default}")
 
 
+def _verify_token(token_path: str, scopes: list) -> Optional[str]:
+    """Try to authenticate with a token file and return the email, or None if invalid."""
+    if not os.path.exists(token_path):
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, scopes)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                return None
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        profile = service.users().getProfile(userId="me").execute()
+        return profile.get("emailAddress")
+    except Exception:
+        return None
+
+
 def check_setup() -> dict:
-    """Check if the skill is properly set up. Returns status dict."""
+    """Check if the skill is properly set up. Verifies tokens with a real API call."""
     status = {
         "config_exists": os.path.exists(CONFIG_PATH),
         "credentials_exists": os.path.exists(DEFAULT_CREDENTIALS_PATH),
@@ -405,15 +445,19 @@ def check_setup() -> dict:
         try:
             with open(CONFIG_PATH, "rb") as f:
                 config = tomllib.load(f)
+            scopes = config.get("gmail", {}).get(
+                "scopes", ["https://www.googleapis.com/auth/gmail.modify"]
+            )
             accounts = config.get("accounts", {})
             for name, info in accounts.items():
                 token_path = info.get("token_path", f"tokens/{name}.json")
                 if not os.path.isabs(token_path):
                     token_path = os.path.join(SKILL_DIR, token_path)
+                verified_email = _verify_token(token_path, scopes)
                 status["accounts"].append({
                     "name": name,
-                    "email": info.get("email"),
-                    "authenticated": os.path.exists(token_path),
+                    "email": verified_email or info.get("email"),
+                    "authenticated": verified_email is not None,
                 })
         except Exception as e:
             logging.debug(f"Error checking setup: {e}")

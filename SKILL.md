@@ -1,6 +1,10 @@
 ---
 name: email-copilot
-description: Manages inbox by learning preferences, cleaning noise, and prioritizing important work. Use when user asks about emails or inbox management.
+description: Check, read, label, archive, and manage emails across multiple accounts. Use when asked to check inbox, read emails, clean up mail, or handle email-related tasks.
+hints:
+  - "email"
+  - "inbox"
+  - "mail"
 ---
 
 ## Critical Rules
@@ -11,6 +15,7 @@ description: Manages inbox by learning preferences, cleaning noise, and prioriti
 4. **ALWAYS** use label names (e.g., "Finance/Receipts"), never internal IDs (e.g., "Label_6")
 5. **CHECK** `account` field in output before operations
 6. **LOG** all user-confirmed actions to `.claude/skills/email-copilot/action-log.md` — **IMMEDIATELY in the same tool call batch as execution, NOT after**
+7. **AUTH EXPIRED**: If any command returns `"status": "auth_expired"`, **stop processing that account** and tell the user to run the command shown in the `command` field in their terminal. Do NOT attempt to run `--auth` yourself — it requires interactive browser login
 
 ## CLI Alias
 
@@ -68,7 +73,9 @@ $EMAIL [-a ACCOUNT] cleanup <label> [-d DAYS]
 
 ## Procedure
 
-1. **Check Accounts**: `$EMAIL accounts`
+1. **Check Accounts**: `$GMAIL --check` (verifies tokens are valid with real API call)
+   - If any account shows `"authenticated": false`, tell user to run: `cd .claude/skills/email-copilot && uv run python gmail_client.py --auth <name>`
+   - Do NOT proceed with that account until user confirms re-auth is done
 2. **Load Rules**: Read `.claude/skills/email-copilot/rules.md` (MANDATORY)
 3. **Review Action Log**: Read `.claude/skills/email-copilot/action-log.md` to identify patterns from recent decisions
 4. **Process Each Account**:
