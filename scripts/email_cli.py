@@ -11,11 +11,13 @@ import base64
 import argparse
 import mimetypes
 import re
+import html
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime, parseaddr
+from datetime import datetime, timedelta, timezone
 
 # Add skill directory to sys.path for local imports
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,102 +71,267 @@ def cmd_accounts(args):
 # Email Operations
 # =============================================================================
 
-def cmd_list(args):
-    """List emails with optional search query."""
-    client = get_client(args.account)
+# =============================================================================
+# Display contracts for `inbox`, `search`, and `thread`
+#
+# `inbox` and `search` share the same per-thread rendering and pagination —
+# see `_run_thread_listing`. The only differences are the filter passed to
+# threads.list and how the summary line is built.
+#
+# `inbox` — Gmail-client-style overview
+#   - Aggregates by thread, never by message. One row per conversation.
+#   - Sorted by the thread's latest-message time (Gmail API default).
+#   - Header summary uses the INBOX label's `threadsTotal`/`threadsUnread` so
+#     counts match what Gmail's own UI shows (same-thread duplicates collapsed).
+#   - Each row shows the LATEST message's metadata (id, from, to, subject,
+#     date, reply_to when distinct from from). Replying acts on that id.
+#   - Unread display:
+#       multi-message thread → `unread: N/total` (e.g. 3/20)
+#       single unread        → `unread: yes`
+#       single read          → line omitted
+#   - User labels rendered as `[[name]]` (system labels INBOX/UNREAD/CATEGORY_*
+#     filtered out via type=="user").
+#   - Pagination: --limit (default 100) / --skip (walks pages, slow) /
+#     --cursor (page token from a prior call's `next_cursor`, efficient).
+#   - Footer: blank line, then `page: current/total`, plus `next_cursor: ...`
+#     when more pages exist.
+#
+# `search` — same rendering as inbox, with a Gmail query instead of label:INBOX
+#   - Summary uses Gmail's `resultSizeEstimate` (an approximation), prefixed
+#     with `~` to signal that. Page count is derived from the estimate, so the
+#     `total` denominator may drift by a few near edges.
+#   - Query syntax = Gmail search operators. Pass them as a single shell arg
+#     (quote when there are spaces). Operators are combined by space = AND.
+#
+#     Location:      in:inbox|trash|spam|sent|drafts|anywhere
+#                    label:Name | label:Parent/Child | -label:Name
+#                    category:primary|promotions|updates|social|forums
+#     State:         is:unread|read|starred|important|snoozed|muted
+#     People:        from:addr  to:addr  cc:  bcc:  deliveredto:
+#                    list:dev@yourdomain.example
+#     Subject/body:  subject:foo  subject:"quarterly review"
+#                    (bare keywords search full text)
+#     Time:          newer_than:3d|m|y  older_than:7d
+#                    after:2026/01/01   before:2026/03/01
+#     Attachments:   has:attachment|drive|document
+#                    filename:pdf  filename:invoice.pdf
+#                    larger:5M  smaller:200K
+#     Logic:         OR (uppercase)   -term (exclude)
+#                    {a b c} = a OR b OR c
+#                    ("exact phrase")   AROUND N (proximity)
+#
+#     Common recipes:
+#       "in:inbox is:unread label:Notifiers/github"
+#       "from:support@yourdomain.example newer_than:2d"
+#       "is:unread -category:promotions -label:Newsletters"
+#       "has:attachment filename:pdf newer_than:30d"
+#       "subject:invoice OR subject:receipt"
+#
+# `thread` — full conversation expanded
+#   - Default --limit 20 from the newest end; --skip moves into deeper history.
+#   - Header `subject` is the FIRST (oldest) message's subject — the original
+#     topic, not "Re:" chains.
+#   - Per message: full body, headers (from/to/cc/reply_to), and attachments.
+#     Bodies pass through clean_body (strip zero-width chars, collapse blank
+#     runs) then gfm_quote_body (attribution lines like "On … wrote:" mark the
+#     start of an inline reply quote; subsequent lines get `> ` prefixes,
+#     nested quotes deepen the prefix).
+#   - Messages printed chronologically within the page, separated by
+#     `--- message N/total ---`. Footer: `shown: A-B/total`.
+#
+# `labels` and `filters` follow the same text style:
+#   - Listings start with `account:` + a `labels:` / `filters:` summary line.
+#   - User labels render as `[[name]]`; system labels (INBOX, STARRED, …) as
+#     bare uppercase, matching how they appear in Gmail's API.
+#   - Filters are rendered as `if X / then Y` blocks. Common system-label
+#     actions get verb names: INBOX in remove → `archive`, UNREAD in remove →
+#     `mark_read`, STARRED → `star`, IMPORTANT → `mark_important`, TRASH/SPAM
+#     → `trash`/`spam`. Anything else falls back to `then label: [[name]]` or
+#     `then remove_label: SYSNAME`.
+#   - Mutations (`labels create/delete/rename`, `filters add/delete`) emit
+#     short `account:` + action confirmation lines. `filters add` re-renders
+#     the newly created filter using the same `if/then` formatter so the
+#     caller sees exactly what got installed.
+# =============================================================================
 
-    query = args.query if args.query else "label:INBOX"
-    all_msgs = []
-    page_token = None
 
-    while len(all_msgs) < args.limit:
-        try:
-            res = (
-                client.service.users()
-                .messages()
-                .list(
-                    userId="me",
-                    q=query,
-                    maxResults=min(args.limit - len(all_msgs), 500),
-                    pageToken=page_token,
-                )
-                .execute()
+def _run_thread_listing(client, list_kwargs: dict, args, summary_fn):
+    """Paginated thread listing shared by `inbox` and `search`.
+
+    list_kwargs: filter args for threads.list (e.g. {"labelIds": ["INBOX"]} or {"q": "..."}).
+    summary_fn: callable(result_size_estimate: int) -> (summary_line: str, total_count: int).
+                Called once with the resultSizeEstimate observed in the first API response.
+    """
+    limit = max(1, args.limit)
+    skip = max(0, args.skip or 0)
+    page_token = args.cursor
+    total_estimate = 0
+    estimate_captured = False
+
+    def threads_list(token, page_size):
+        return (
+            client.service.users()
+            .threads()
+            .list(
+                userId="me",
+                maxResults=min(page_size, 500),
+                pageToken=token,
+                **list_kwargs,
             )
+            .execute()
+        )
 
-            msgs = res.get("messages", [])
-            if not msgs:
-                if not page_token:
-                    break
-            else:
-                all_msgs.extend(msgs)
-
-            page_token = res.get("nextPageToken")
-            if not page_token:
+    # Walk skip pages when --skip is given without --cursor.
+    if page_token is None and skip > 0:
+        remaining = skip
+        while remaining > 0:
+            try:
+                step = threads_list(page_token, remaining)
+            except Exception as e:
+                output_error(str(e), client.account_email)
+                return
+            if not estimate_captured:
+                total_estimate = step.get("resultSizeEstimate", 0)
+                estimate_captured = True
+            walked = len(step.get("threads", []))
+            page_token = step.get("nextPageToken")
+            if walked == 0 or page_token is None:
                 break
-        except Exception as e:
-            print(f"<error account='{client.account_email}'>{str(e)}</error>")
-            return
+            remaining -= walked
 
-    if not all_msgs:
-        print(f"<emails account='{client.account_email}' account_name='{client.account_name}' count='0'></emails>")
+    # Fetch up to `limit` threads, paginating through 500-cap responses if needed.
+    threads = []
+    next_token = page_token
+    while len(threads) < limit:
+        try:
+            res = threads_list(next_token, limit - len(threads))
+        except Exception as e:
+            output_error(str(e), client.account_email)
+            return
+        if not estimate_captured:
+            total_estimate = res.get("resultSizeEstimate", 0)
+            estimate_captured = True
+        threads.extend(res.get("threads", []))
+        next_token = res.get("nextPageToken")
+        if not next_token:
+            break
+    threads = threads[:limit]
+
+    summary_line, total_count = summary_fn(total_estimate)
+    header_line = f"account: {client.account_email} ({client.account_name})"
+
+    total_pages = max(1, (total_count + limit - 1) // limit) if total_count else 1
+    current_page = (skip // limit) + 1
+
+    footer_lines = ["", f"page: {current_page}/{total_pages}"]
+    if next_token:
+        footer_lines.append(f"next_cursor: {next_token}")
+
+    if not threads:
+        print("\n".join([header_line, summary_line] + footer_lines))
         return
 
-    # Fetch details in batch
+    label_map = _build_user_label_map(client)
+    thread_data = {}
     chunk_size = 50
-    output = [f"<emails account='{client.account_email}' account_name='{client.account_name}' count='{len(all_msgs)}'>"]
-
-    for i in range(0, len(all_msgs), chunk_size):
-        chunk = all_msgs[i : i + chunk_size]
+    for i in range(0, len(threads), chunk_size):
+        chunk = threads[i : i + chunk_size]
         batch = client.service.new_batch_http_request()
-        batch_resp = {}
 
         def cb(rid, resp, exc):
             if not exc:
-                batch_resp[rid] = resp
+                thread_data[rid] = resp
 
-        for msg in chunk:
+        for t in chunk:
             batch.add(
                 client.service.users()
-                .messages()
-                .get(userId="me", id=msg["id"], format="full"),
-                request_id=msg["id"],
+                .threads()
+                .get(
+                    userId="me",
+                    id=t["id"],
+                    format="metadata",
+                    metadataHeaders=["From", "To", "Subject", "Date", "Reply-To"],
+                ),
+                request_id=t["id"],
                 callback=cb,
             )
-
         try:
             batch.execute()
         except Exception as e:
-            output.append(f"  <batch_error>{str(e)}</batch_error>")
+            output_error(f"Batch error: {e}", client.account_email)
+            return
+
+    blocks = [header_line, summary_line, ""]
+    for t in threads:
+        thread = thread_data.get(t["id"])
+        if not thread:
+            continue
+        messages = thread.get("messages", [])
+        if not messages:
             continue
 
-        for mid, data in batch_resp.items():
-            payload = data.get("payload", {})
-            headers = payload.get("headers", [])
+        total = len(messages)
+        unread = sum(1 for m in messages if "UNREAD" in m.get("labelIds", []))
+        latest = messages[-1]
+        headers = latest.get("payload", {}).get("headers", [])
 
-            subject = next(
-                (h["value"] for h in headers if h["name"].lower() == "subject"),
-                "No Subject",
-            )
-            sender = next(
-                (h["value"] for h in headers if h["name"].lower() == "from"), "Unknown"
-            )
-            date = next(
-                (h["value"] for h in headers if h["name"].lower() == "date"), ""
-            )
-            snippet = (
-                data.get("snippet", "").replace("<", "&lt;").replace(">", "&gt;")
-            )
-            thread_id = data.get("threadId", "")
+        from_raw = get_header(headers, "from", "Unknown")
+        from_email = parseaddr(from_raw)[1].lower()
+        reply_to = get_header(headers, "reply-to")
 
-            output.append(f"""  <email id="{mid}" thread_id="{thread_id}">
-    <from>{sender}</from>
-    <subject>{subject}</subject>
-    <date>{date}</date>
-    <snippet>{snippet}</snippet>
-  </email>""")
+        label_ids = set()
+        for m in messages:
+            label_ids.update(m.get("labelIds", []))
+        user_labels = sorted(label_map[lid] for lid in label_ids if lid in label_map)
+        labels_str = " ".join(f"[[{n}]]" for n in user_labels)
 
-    output.append("</emails>")
-    print("\n".join(output))
+        blocks.append(f"id: {latest['id']} (thread_id: {thread['id']})")
+        if total > 1:
+            blocks.append(f"unread: {unread}/{total}")
+        elif unread:
+            blocks.append("unread: yes")
+        blocks.append(f"date: {format_date(get_header(headers, 'date'))}")
+        blocks.append(f"from: {from_raw}")
+        blocks.append(f"to: {get_header(headers, 'to')}")
+        if reply_to and parseaddr(reply_to)[1].lower() != from_email:
+            blocks.append(f"reply_to: {reply_to}")
+        blocks.append(f"subject: {get_header(headers, 'subject', 'No Subject')}")
+        if labels_str:
+            blocks.append(f"labels: {labels_str}")
+        blocks.append(f"snippet: {clean_snippet(latest.get('snippet', ''))}")
+        blocks.append("")
+
+    print("\n".join(blocks).rstrip() + "\n\n" + "\n".join(footer_lines[1:]))
+
+
+def cmd_inbox(args):
+    """Gmail-client-style inbox view: threads sorted by recency, with unread/label info."""
+    client = get_client(args.account)
+    try:
+        inbox_label = client.service.users().labels().get(userId="me", id="INBOX").execute()
+    except Exception as e:
+        output_error(f"Could not fetch inbox metadata: {e}", client.account_email)
+        return
+    total = inbox_label.get("threadsTotal", 0)
+    unread = inbox_label.get("threadsUnread", 0)
+    _run_thread_listing(
+        client,
+        list_kwargs={"labelIds": ["INBOX"]},
+        args=args,
+        summary_fn=lambda _est: (f"inbox: {total} threads, {unread} unread", total),
+    )
+
+
+def cmd_search(args):
+    """Run a Gmail search and render results with the inbox display contract."""
+    client = get_client(args.account)
+    q = args.query
+    _run_thread_listing(
+        client,
+        list_kwargs={"q": q},
+        args=args,
+        summary_fn=lambda est: (f"search {q!r}: ~{est} matches", est),
+    )
 
 
 def cmd_read(args):
@@ -178,39 +345,140 @@ def cmd_read(args):
             .get(userId="me", id=args.id, format="full")
             .execute()
         )
-
-        payload = msg.get("payload", {})
-        headers = payload.get("headers", [])
-        subject = get_header(headers, "subject", "No Subject")
-        sender = get_header(headers, "from", "Unknown")
-        reply_to = get_header(headers, "reply-to") or None
-
-        body = ""
-        if "parts" in payload:
-            for part in payload["parts"]:
-                if part["mimeType"] == "text/plain":
-                    data = part["body"].get("data", "")
-                    if data:
-                        body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-                        break
-        elif "body" in payload:
-            data = payload["body"].get("data", "")
-            if data:
-                body = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-
-        if not body:
-            body = msg.get("snippet", "")
-
-        print(f"Account: {client.account_email} ({client.account_name})")
-        print(f"Labels: {', '.join(msg.get('labelIds', []))}")
-        print(f"Subject: {subject}")
-        print(f"From: {sender}")
-        if reply_to:
-            print(f"Reply-To: {reply_to}")
-        print(f"{'-' * 40}\n{body}")
-
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    label_map = _build_user_label_map(client)
+    print(_format_message_detail(client, msg, label_map))
+
+
+def _format_message_detail(client, msg: dict, label_map: dict) -> str:
+    """Render a single message with full body, attachments, and user labels."""
+    payload = msg.get("payload", {})
+    headers = payload.get("headers", [])
+
+    from_raw = get_header(headers, "from", "Unknown")
+    from_email = parseaddr(from_raw)[1].lower()
+    reply_to = get_header(headers, "reply-to")
+    cc = get_header(headers, "cc")
+    bcc = get_header(headers, "bcc")
+
+    label_ids = msg.get("labelIds", [])
+    labels_str = format_user_labels(label_ids, label_map)
+    attachments = collect_attachments(payload)
+    body = gfm_quote_body(clean_body(extract_body(payload))) or clean_snippet(msg.get("snippet", ""))
+
+    lines = [
+        f"account: {client.account_email} ({client.account_name})",
+        f"id: {msg['id']} (thread_id: {msg.get('threadId', '')})",
+        f"date: {format_date(get_header(headers, 'date'))}",
+        f"from: {from_raw}",
+        f"to: {get_header(headers, 'to')}",
+    ]
+    if cc:
+        lines.append(f"cc: {cc}")
+    if bcc:
+        lines.append(f"bcc: {bcc}")
+    if reply_to and parseaddr(reply_to)[1].lower() != from_email:
+        lines.append(f"reply_to: {reply_to}")
+    lines.append(f"subject: {get_header(headers, 'subject', 'No Subject')}")
+    if "UNREAD" in label_ids:
+        lines.append("unread: yes")
+    if labels_str:
+        lines.append(f"labels: {labels_str}")
+    if attachments:
+        atts = ", ".join(f"{a['filename']} ({fmt_size(a['size'])})" for a in attachments)
+        lines.append(f"attachments: {atts}")
+    lines.append("")
+    lines.append(body.rstrip())
+    return "\n".join(lines)
+
+
+def cmd_thread(args):
+    """Show a full thread with bodies. Paginates with --limit/--skip from newest."""
+    client = get_client(args.account)
+
+    try:
+        thread = (
+            client.service.users()
+            .threads()
+            .get(userId="me", id=args.id, format="full")
+            .execute()
+        )
+    except Exception as e:
+        output_error(str(e), client.account_email)
+        return
+
+    messages = thread.get("messages", [])
+    total = len(messages)
+    if total == 0:
+        print(f"account: {client.account_email} ({client.account_name})\nthread_id: {args.id}\nmessages: 0")
+        return
+
+    limit = max(1, args.limit)
+    skip = max(0, args.skip or 0)
+    end = max(0, total - skip)
+    start = max(0, end - limit)
+    sliced = messages[start:end]
+    positions = list(range(start + 1, end + 1))
+
+    label_map = _build_user_label_map(client)
+    all_label_ids = set()
+    for m in messages:
+        all_label_ids.update(m.get("labelIds", []))
+    thread_labels = format_user_labels(all_label_ids, label_map)
+
+    unread_count = sum(1 for m in messages if "UNREAD" in m.get("labelIds", []))
+    first_headers = messages[0].get("payload", {}).get("headers", [])
+    thread_subject = get_header(first_headers, "subject", "No Subject")
+
+    header_lines = [
+        f"account: {client.account_email} ({client.account_name})",
+        f"thread_id: {args.id}",
+        f"messages: {total} ({unread_count} unread)",
+        f"subject: {thread_subject}",
+    ]
+    if thread_labels:
+        header_lines.append(f"labels: {thread_labels}")
+
+    footer_line = f"shown: {start + 1}-{end}/{total}" if sliced else f"shown: 0/{total}"
+
+    if not sliced:
+        print("\n".join(header_lines + ["", footer_line]))
+        return
+
+    blocks = ["\n".join(header_lines)]
+    for pos, msg in zip(positions, sliced):
+        payload = msg.get("payload", {})
+        headers = payload.get("headers", [])
+        from_raw = get_header(headers, "from", "Unknown")
+        from_email = parseaddr(from_raw)[1].lower()
+        reply_to = get_header(headers, "reply-to")
+        label_ids = msg.get("labelIds", [])
+
+        msg_lines = [f"--- message {pos}/{total} ---"]
+        msg_lines.append(f"id: {msg['id']}")
+        msg_lines.append(f"date: {format_date(get_header(headers, 'date'))}")
+        msg_lines.append(f"from: {from_raw}")
+        msg_lines.append(f"to: {get_header(headers, 'to')}")
+        cc = get_header(headers, "cc")
+        if cc:
+            msg_lines.append(f"cc: {cc}")
+        if reply_to and parseaddr(reply_to)[1].lower() != from_email:
+            msg_lines.append(f"reply_to: {reply_to}")
+        if "UNREAD" in label_ids:
+            msg_lines.append("unread: yes")
+        attachments = collect_attachments(payload)
+        if attachments:
+            atts = ", ".join(f"{a['filename']} ({fmt_size(a['size'])})" for a in attachments)
+            msg_lines.append(f"attachments: {atts}")
+        body = gfm_quote_body(clean_body(extract_body(payload))) or clean_snippet(msg.get("snippet", ""))
+        msg_lines.append("")
+        msg_lines.append(body.rstrip())
+        blocks.append("\n".join(msg_lines))
+
+    print("\n\n".join(blocks) + "\n\n" + footer_line)
 
 
 def cmd_trash(args):
@@ -429,120 +697,193 @@ def _list_labels(client):
     return results.get("labels", [])
 
 
-def cmd_labels_list(args):
-    """List all Gmail labels."""
-    client = get_client(args.account)
+def _build_user_label_map(client):
+    """Map {label_id: label_name} for user-created labels (skips system labels)."""
+    return {
+        l["id"]: l["name"]
+        for l in _list_labels(client)
+        if l.get("type") == "user"
+    }
 
+
+def _build_full_label_map(client):
+    """Map {label_id: (name, type)} for all labels including system ones."""
+    return {
+        l["id"]: (l.get("name", l["id"]), l.get("type", "user"))
+        for l in _list_labels(client)
+    }
+
+
+def _label_display(label_id: str, label_map: dict) -> str:
+    """Render a label reference: [[name]] for user labels, raw NAME for system."""
+    if label_id not in label_map:
+        return f"<{label_id}>"
+    name, ltype = label_map[label_id]
+    return f"[[{name}]]" if ltype == "user" else name
+
+
+def _format_filter(filt: dict, label_map: dict) -> str:
+    """Render a Gmail filter as a text block with `if/then` lines."""
+    lines = [f"filter_id: {filt.get('id', '?')}"]
+    criteria = filt.get("criteria", {})
+    action = filt.get("action", {})
+
+    for key in ("from", "to", "subject", "query"):
+        val = criteria.get(key)
+        if val:
+            lines.append(f"  if {key}: {val}")
+    if criteria.get("hasAttachment"):
+        lines.append("  if has_attachment")
+    if criteria.get("excludeChats"):
+        lines.append("  if exclude_chats")
+    if criteria.get("size"):
+        comp = criteria.get("sizeComparison", "")
+        lines.append(f"  if size {comp} {criteria['size']}")
+
+    add_ids = list(action.get("addLabelIds", []))
+    remove_ids = list(action.get("removeLabelIds", []))
+
+    # Translate common system-label actions into verbs.
+    verbs_remove = {"INBOX": "archive", "UNREAD": "mark_read"}
+    verbs_add = {"STARRED": "star", "IMPORTANT": "mark_important", "TRASH": "trash", "SPAM": "spam"}
+    for sys_id, verb in verbs_remove.items():
+        if sys_id in remove_ids:
+            lines.append(f"  then {verb}")
+            remove_ids.remove(sys_id)
+    for sys_id, verb in verbs_add.items():
+        if sys_id in add_ids:
+            lines.append(f"  then {verb}")
+            add_ids.remove(sys_id)
+
+    for lid in add_ids:
+        lines.append(f"  then label: {_label_display(lid, label_map)}")
+    for lid in remove_ids:
+        lines.append(f"  then remove_label: {_label_display(lid, label_map)}")
+    if action.get("forward"):
+        lines.append(f"  then forward: {action['forward']}")
+
+    return "\n".join(lines)
+
+
+def cmd_labels_list(args):
+    """List Gmail labels grouped by system/user with message counts."""
+    client = get_client(args.account)
     try:
         labels = _list_labels(client)
-
-        output = []
-        for label in labels:
-            label_info = {
-                "id": label.get("id"),
-                "name": label.get("name"),
-                "type": label.get("type"),
-            }
-            # Include message counts if available
-            if "messagesTotal" in label:
-                label_info["messages_total"] = label.get("messagesTotal")
-                label_info["messages_unread"] = label.get("messagesUnread")
-            output.append(label_info)
-
-        # Sort: system labels first, then user labels alphabetically
-        system_labels = [l for l in output if l["type"] == "system"]
-        user_labels = sorted([l for l in output if l["type"] == "user"], key=lambda x: x["name"].lower())
-
-        print(json.dumps({
-            "status": "success",
-            "labels": system_labels + user_labels,
-            "count": len(output),
-            "user_labels": len(user_labels),
-            "account": client.account_email
-        }, indent=2))
-
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    n_total = len(labels)
+    n_user = sum(1 for l in labels if l.get("type") == "user")
+    n_system = n_total - n_user
+
+    system_labels = [l for l in labels if l.get("type") == "system"]
+    user_labels = sorted(
+        [l for l in labels if l.get("type") == "user"],
+        key=lambda x: (x.get("name") or "").lower(),
+    )
+
+    def fmt_count(l):
+        total = l.get("messagesTotal")
+        if total is None:
+            return ""
+        unread = l.get("messagesUnread", 0)
+        return f" ({total} msgs, {unread} unread)" if unread else f" ({total} msgs)"
+
+    lines = [
+        f"account: {client.account_email} ({client.account_name})",
+        f"labels: {n_total} total ({n_system} system, {n_user} user)",
+    ]
+    if system_labels:
+        lines.append("")
+        lines.append("system:")
+        for l in system_labels:
+            lines.append(f"- {l.get('name', l['id'])}{fmt_count(l)}")
+    if user_labels:
+        lines.append("")
+        lines.append("user:")
+        for l in user_labels:
+            name = l.get("name", l["id"])
+            indent = "  " * name.count("/")
+            lines.append(f"{indent}- [[{name}]]{fmt_count(l)}")
+
+    print("\n".join(lines))
 
 
 def cmd_labels_create(args):
     """Create a new Gmail label."""
     client = get_client(args.account)
-
     try:
-        label_object = {
-            "name": args.name,
-            "labelListVisibility": "labelShow",
-            "messageListVisibility": "show",
-        }
         result = client.service.users().labels().create(
-            userId="me", body=label_object
+            userId="me",
+            body={
+                "name": args.name,
+                "labelListVisibility": "labelShow",
+                "messageListVisibility": "show",
+            },
         ).execute()
-
-        output_success({
-            "label_id": result.get("id"),
-            "name": result.get("name")
-        }, client.account_email)
-
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    print(f"account: {client.account_email} ({client.account_name})")
+    print(f"created label: [[{result.get('name', args.name)}]]")
+    print(f"id: {result.get('id')}")
 
 
 def cmd_labels_delete(args):
     """Delete a Gmail label by name or ID."""
     client = get_client(args.account)
-
     try:
         label_id, label_name, label_type = resolve_label(client, args.name_or_id)
-        if not label_id:
-            output_error(f"Label not found: {args.name_or_id}", client.account_email)
-            return
-
-        # Prevent deleting system labels
-        if label_type == "system":
-            output_error(f"Cannot delete system label: {label_name}", client.account_email)
-            return
-
-        client.service.users().labels().delete(userId="me", id=label_id).execute()
-
-        output_success({
-            "deleted_label_id": label_id,
-            "deleted_label_name": label_name
-        }, client.account_email)
-
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    if not label_id:
+        output_error(f"Label not found: {args.name_or_id}", client.account_email)
+        return
+    if label_type == "system":
+        output_error(f"Cannot delete system label: {label_name}", client.account_email)
+        return
+
+    try:
+        client.service.users().labels().delete(userId="me", id=label_id).execute()
+    except Exception as e:
+        output_error(str(e), client.account_email)
+        return
+
+    print(f"account: {client.account_email} ({client.account_name})")
+    print(f"deleted label: [[{label_name}]]")
 
 
 def cmd_labels_rename(args):
     """Rename a Gmail label."""
     client = get_client(args.account)
-
     try:
         label_id, old_name, label_type = resolve_label(client, args.old_name)
-        if not label_id:
-            output_error(f"Label not found: {args.old_name}", client.account_email)
-            return
-
-        if label_type == "system":
-            output_error(f"Cannot rename system label: {old_name}", client.account_email)
-            return
-
-        # Update the label
-        result = client.service.users().labels().patch(
-            userId="me",
-            id=label_id,
-            body={"name": args.new_name}
-        ).execute()
-
-        output_success({
-            "label_id": label_id,
-            "old_name": old_name,
-            "new_name": result.get("name")
-        }, client.account_email)
-
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    if not label_id:
+        output_error(f"Label not found: {args.old_name}", client.account_email)
+        return
+    if label_type == "system":
+        output_error(f"Cannot rename system label: {old_name}", client.account_email)
+        return
+
+    try:
+        result = client.service.users().labels().patch(
+            userId="me", id=label_id, body={"name": args.new_name}
+        ).execute()
+    except Exception as e:
+        output_error(str(e), client.account_email)
+        return
+
+    print(f"account: {client.account_email} ({client.account_name})")
+    print(f"renamed label: [[{old_name}]] -> [[{result.get('name', args.new_name)}]]")
 
 
 # =============================================================================
@@ -550,52 +891,33 @@ def cmd_labels_rename(args):
 # =============================================================================
 
 def cmd_filters_list(args):
-    """List all Gmail filters."""
+    """List all Gmail filters as if/then blocks."""
     client = get_client(args.account)
-
     try:
         results = client.service.users().settings().filters().list(userId="me").execute()
-        filters = results.get("filter", [])
-
-        if not filters:
-            print(json.dumps({"filters": [], "count": 0, "account": client.account_email}))
-            return
-
-        output = []
-        for f in filters:
-            criteria = f.get("criteria", {})
-            action = f.get("action", {})
-
-            filter_info = {
-                "id": f.get("id"),
-                "criteria": {
-                    "from": criteria.get("from"),
-                    "to": criteria.get("to"),
-                    "subject": criteria.get("subject"),
-                    "query": criteria.get("query"),
-                    "hasAttachment": criteria.get("hasAttachment"),
-                },
-                "action": {
-                    "addLabelIds": action.get("addLabelIds", []),
-                    "removeLabelIds": action.get("removeLabelIds", []),
-                    "forward": action.get("forward"),
-                },
-            }
-            # Remove None values
-            filter_info["criteria"] = {k: v for k, v in filter_info["criteria"].items() if v is not None}
-            filter_info["action"] = {k: v for k, v in filter_info["action"].items() if v}
-            output.append(filter_info)
-
-        print(json.dumps({"filters": output, "count": len(output), "account": client.account_email}, indent=2))
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    filters = results.get("filter", [])
+    header_line = f"account: {client.account_email} ({client.account_name})"
+    summary_line = f"filters: {len(filters)} total"
+
+    if not filters:
+        print(f"{header_line}\n{summary_line}")
+        return
+
+    label_map = _build_full_label_map(client)
+    blocks = [f"{header_line}\n{summary_line}"]
+    for f in filters:
+        blocks.append(_format_filter(f, label_map))
+    print("\n\n".join(blocks))
 
 
 def cmd_filters_add(args):
     """Add a new Gmail filter."""
     client = get_client(args.account)
 
-    # Build criteria
     criteria = {}
     if args.sender:
         criteria["from"] = args.sender
@@ -612,7 +934,6 @@ def cmd_filters_add(args):
         output_error("At least one criteria required", client.account_email)
         return
 
-    # Build action
     action = {}
     if args.add_label:
         label_id = ensure_label(client, args.add_label, create=True)
@@ -635,28 +956,33 @@ def cmd_filters_add(args):
         output_error("At least one action required", client.account_email)
         return
 
-    filter_body = {"criteria": criteria, "action": action}
-
     try:
         result = client.service.users().settings().filters().create(
-            userId="me", body=filter_body
+            userId="me", body={"criteria": criteria, "action": action}
         ).execute()
-        output_success({"filter_id": result.get("id")}, client.account_email)
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    label_map = _build_full_label_map(client)
+    print(f"account: {client.account_email} ({client.account_name})")
+    print("created filter:")
+    print(_format_filter(result, label_map))
 
 
 def cmd_filters_delete(args):
     """Delete a Gmail filter by ID."""
     client = get_client(args.account)
-
     try:
         client.service.users().settings().filters().delete(
             userId="me", id=args.id
         ).execute()
-        output_success({"deleted_id": args.id}, client.account_email)
     except Exception as e:
         output_error(str(e), client.account_email)
+        return
+
+    print(f"account: {client.account_email} ({client.account_name})")
+    print(f"deleted filter: {args.id}")
 
 
 # =============================================================================
@@ -995,7 +1321,7 @@ def cmd_reply(args):
         original_subject = get_header(headers, "subject")
         original_from = get_header(headers, "from")
         reply_to = get_header(headers, "reply-to") or None
-        recipient = reply_to if reply_to else original_from
+        recipient = args.to if args.to else (reply_to if reply_to else original_from)
         message_id = get_header(headers, "message-id")
         references = get_header(headers, "references")
 
@@ -1013,6 +1339,8 @@ def cmd_reply(args):
 
         if args.cc:
             message["cc"] = args.cc
+        if args.bcc:
+            message["bcc"] = args.bcc
 
         # Encode and send
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8", errors="replace")
@@ -1280,6 +1608,187 @@ def get_header(headers: list, name: str, default: str = "") -> str:
     )
 
 
+# Zero-width, bidi-control, joiner, soft-hyphen, BOM — common noise in marketing snippets.
+_INVISIBLE_CHARS_RE = re.compile(
+    r"[\u00AD\u034F\u200B-\u200F\u202A-\u202E\u2060-\u2064\u206A-\u206F\uFEFF]"
+)
+
+
+def clean_snippet(s: str) -> str:
+    """Strip invisible chars, decode HTML entities, collapse whitespace."""
+    if not s:
+        return ""
+    s = html.unescape(s)
+    s = _INVISIBLE_CHARS_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def clean_body(s: str) -> str:
+    """Strip invisible chars and trailing-whitespace lines; collapse 2+ blank lines."""
+    if not s:
+        return ""
+    s = _INVISIBLE_CHARS_RE.sub("", s)
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+# Reply attribution markers — when a body inlines the previous message, lines after this
+# get treated as a quoted block. Covers common English/Chinese/Forwarded-message styles.
+_QUOTE_MARKER_RE = re.compile(
+    r"^\s*(?:"
+    r"On\b.{1,500}\bwrote\s*[:：]"
+    r"|.{1,300}\b写道\s*[:：]"
+    r"|-{2,}\s*Original Message\s*-{2,}"
+    r"|-{2,}\s*Forwarded message\s*-{2,}"
+    r")\s*$"
+)
+
+
+def gfm_quote_body(body: str) -> str:
+    """Wrap inline reply quotes in GFM blockquote markers based on attribution lines."""
+    if not body:
+        return body
+    lines = body.split("\n")
+    out = []
+    depth = 0
+    for line in lines:
+        if _QUOTE_MARKER_RE.match(line):
+            prefix = "> " * depth
+            out.append(prefix + line)
+            depth += 1
+            continue
+        if depth > 0:
+            stripped = line.lstrip()
+            if not stripped:
+                out.append(("> " * depth).rstrip())
+            else:
+                out.append("> " * depth + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def extract_body(payload: dict) -> str:
+    """Walk Gmail payload tree and return the first text/plain body (fallback: text/html stripped)."""
+    if not payload:
+        return ""
+
+    mime = payload.get("mimeType", "")
+    body = payload.get("body", {})
+
+    if mime == "text/plain":
+        data = body.get("data", "")
+        if data:
+            return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+
+    parts = payload.get("parts", [])
+    for part in parts:
+        if part.get("mimeType") == "text/plain":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+
+    for part in parts:
+        if part.get("mimeType", "").startswith("multipart/"):
+            nested = extract_body(part)
+            if nested:
+                return nested
+
+    # Last resort: html stripped to text
+    def find_html(p):
+        if p.get("mimeType") == "text/html":
+            data = p.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
+        for sub in p.get("parts", []):
+            r = find_html(sub)
+            if r:
+                return r
+        return ""
+
+    html_body = find_html(payload)
+    if html_body:
+        text = re.sub(r"<[^>]+>", " ", html_body)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    return ""
+
+
+def collect_attachments(payload: dict, found: list = None) -> list:
+    """Walk payload tree and collect attachment metadata."""
+    if found is None:
+        found = []
+    if not payload:
+        return found
+    filename = payload.get("filename", "")
+    body = payload.get("body", {})
+    if filename and body.get("attachmentId"):
+        found.append({
+            "filename": filename,
+            "size": body.get("size", 0),
+            "mime": payload.get("mimeType", ""),
+        })
+    for part in payload.get("parts", []):
+        collect_attachments(part, found)
+    return found
+
+
+def fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n}B"
+    for unit in ("KB", "MB", "GB"):
+        n /= 1024
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+    return f"{n:.1f}TB"
+
+
+def format_user_labels(label_ids, label_map: dict) -> str:
+    names = sorted(label_map[lid] for lid in label_ids if lid in label_map)
+    return " ".join(f"[[{n}]]" for n in names)
+
+
+def _humanize_delta(delta: timedelta) -> str:
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        seconds = -seconds
+        suffix = "from now"
+    else:
+        suffix = "ago"
+    if seconds < 60:
+        return f"{seconds}s {suffix}"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m {suffix}"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h {suffix}"
+    days = hours // 24
+    if days < 30:
+        return f"{days}d {suffix}"
+    months = days // 30
+    if months < 12:
+        return f"{months}mo {suffix}"
+    return f"{days // 365}y {suffix}"
+
+
+def format_date(raw: str) -> str:
+    """Render RFC 2822 date as 'ISO (relative)'. Falls back to raw on parse failure."""
+    if not raw:
+        return ""
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return raw
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    rel = _humanize_delta(datetime.now(timezone.utc) - dt)
+    return f"{dt.isoformat()} ({rel})"
+
+
 def parse_ids(ids_input):
     """Parse IDs from JSON array or comma-separated string."""
     if not ids_input:
@@ -1401,16 +1910,32 @@ def main():
     p_accounts = subparsers.add_parser("accounts", help="List configured accounts")
     p_accounts.set_defaults(func=cmd_accounts)
 
-    # list
-    p_list = subparsers.add_parser("list", help="List emails")
-    p_list.add_argument("-n", "--limit", type=int, default=100, help="Max emails to fetch")
-    p_list.add_argument("-q", "--query", help="Gmail search query")
-    p_list.set_defaults(func=cmd_list)
+    # inbox
+    p_inbox = subparsers.add_parser("inbox", help="Inbox view (threads, unread counts, user labels)")
+    p_inbox.add_argument("-n", "--limit", type=int, default=100, help="Threads per page (default: 100)")
+    p_inbox.add_argument("--skip", type=int, default=0, help="Skip N threads (slow; walks pages)")
+    p_inbox.add_argument("--cursor", help="Page token from a previous inbox call's next_cursor")
+    p_inbox.set_defaults(func=cmd_inbox)
+
+    # search
+    p_search = subparsers.add_parser("search", help="Search threads with a Gmail query (same display as inbox)")
+    p_search.add_argument("query", help="Gmail search query (e.g. 'from:luca', 'is:unread label:Newsletters')")
+    p_search.add_argument("-n", "--limit", type=int, default=100, help="Threads per page (default: 100)")
+    p_search.add_argument("--skip", type=int, default=0, help="Skip N threads (slow; walks pages)")
+    p_search.add_argument("--cursor", help="Page token from a previous search call's next_cursor")
+    p_search.set_defaults(func=cmd_search)
 
     # read
     p_read = subparsers.add_parser("read", help="Read full email content")
     p_read.add_argument("id", help="Email ID")
     p_read.set_defaults(func=cmd_read)
+
+    # thread
+    p_thread = subparsers.add_parser("thread", help="Show full thread with bodies (paginated)")
+    p_thread.add_argument("id", help="Thread ID")
+    p_thread.add_argument("-n", "--limit", type=int, default=20, help="Messages per page from newest (default: 20)")
+    p_thread.add_argument("--skip", type=int, default=0, help="Skip N newest messages (deeper history)")
+    p_thread.set_defaults(func=cmd_thread)
 
     # trash
     p_trash = subparsers.add_parser("trash", help="Move emails to trash")
@@ -1528,7 +2053,9 @@ def main():
     p_reply = subparsers.add_parser("reply", help="Reply to an email")
     p_reply.add_argument("id", help="Original email ID to reply to")
     p_reply.add_argument("--body", required=True, help="Reply body")
+    p_reply.add_argument("--to", help="Override recipient address")
     p_reply.add_argument("--cc", help="CC recipients (comma-separated)")
+    p_reply.add_argument("--bcc", help="BCC recipients (comma-separated)")
     p_reply.set_defaults(func=cmd_reply)
 
     # drafts - manage drafts
